@@ -597,6 +597,66 @@ fn worktrees_base() -> Result<PathBuf> {
     Ok(p)
 }
 
+/// Crash-safe replacement of a file: write a sibling temp file, fsync it, then
+/// `rename()` it over the destination. Rename within one directory is atomic,
+/// so a reader sees either the whole old file or the whole new one, never a
+/// prefix. `fs::write` truncates first and can strand a half-written (or empty)
+/// file if the process dies, the disk fills, or the machine loses power mid-
+/// write — for settings.json that means `load_settings_inner` silently falls
+/// back to defaults and every preference is gone.
+///
+/// The temp name carries pid + a counter so two writers (two dev instances on
+/// one profile, or two commands racing) can't stage over each other. Leftovers
+/// from a crash are inert dotfiles, and the next successful write of the same
+/// slot doesn't inherit them.
+///
+/// Durability limits, deliberate: the fsync is `fsync(2)`, which on macOS/APFS
+/// flushes to the device but NOT through its write cache (that needs
+/// `F_FULLFSYNC`), and the directory entry isn't fsynced at all. So a hard power
+/// cut can still reorder the data against the rename. Both are fine for the
+/// threat we're defending: a process crash (the common case) is fully covered,
+/// and the worst an OS-level crash costs is the LAST write, leaving the previous
+/// intact file. Paying `F_FULLFSYNC` per settings toggle is not worth the stall.
+fn write_atomic(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // Resolve a symlinked destination. `fs::write` followed the link and wrote
+    // through to its target; `rename()` would instead replace the LINK with a
+    // regular file, silently detaching e.g. a settings.json symlinked into a
+    // dotfiles repo (the repo copy then never updates again, with no error).
+    // canonicalize() only fails when dest doesn't exist yet — the first-write
+    // case, where the raw path is already correct.
+    let resolved = fs::canonicalize(dest).unwrap_or_else(|_| dest.to_path_buf());
+    let dest = resolved.as_path();
+    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
+    let stem = dest.file_name().and_then(|n| n.to_str()).unwrap_or("out");
+    let tmp = dir.join(format!(
+        ".{stem}.tmp.{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed),
+    ));
+    let write = || -> std::io::Result<()> {
+        let mut f = fs::File::create(&tmp)?;
+        // Carry the existing mode across. `fs::write` reused the inode and left
+        // its permissions alone; a fresh temp inode is born 0666 & ~umask, so a
+        // settings.json someone chmod 600'd (agents[].env can hold API keys)
+        // would come back 0644 on the next save.
+        if let Ok(meta) = fs::metadata(dest) {
+            let _ = f.set_permissions(meta.permissions());
+        }
+        f.write_all(bytes)?;
+        // Without this the rename can be visible before the bytes are, so a
+        // crash right after would expose a valid-looking empty file.
+        f.sync_all()?;
+        drop(f);
+        fs::rename(&tmp, dest)
+    };
+    let res = write();
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    res
+}
+
 // ───────────────────────────── projects IO ─────────────────────────────
 
 fn load_projects() -> Vec<Project> {
@@ -729,7 +789,8 @@ fn normalize_member(mut m: ProjectMember) -> Result<ProjectMember, String> {
     Ok(m)
 }
 fn save_projects(list: &[Project]) -> Result<()> {
-    fs::write(projects_file()?, serde_json::to_string_pretty(list)?)?;
+    let json = serde_json::to_string_pretty(list)?;
+    write_atomic(&projects_file()?, json.as_bytes())?;
     Ok(())
 }
 
@@ -741,7 +802,14 @@ fn load_tasks() -> Vec<Task> {
     let mut out = Vec::new();
     if let Ok(rd) = fs::read_dir(&dir) {
         for entry in rd.flatten() {
-            if let Ok(s) = fs::read_to_string(entry.path()) {
+            let path = entry.path();
+            // Only real task records. `save_task` stages through a sibling
+            // `.<id>.json.tmp.<pid>.<n>` file, which holds a COMPLETE, parseable
+            // Task — scanning it mid-write (or picking up one a crash stranded)
+            // would list that task twice. The migration reader already filters
+            // the same way; this also drops .DS_Store and friends.
+            if path.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
+            if let Ok(s) = fs::read_to_string(&path) {
                 if let Ok(w) = serde_json::from_str::<Task>(&s) {
                     out.push(w);
                 }
@@ -766,7 +834,8 @@ fn sort_tasks(list: &mut [Task]) {
 }
 fn save_task(w: &Task) -> Result<()> {
     let f = tasks_dir()?.join(format!("{}.json", w.id));
-    fs::write(&f, serde_json::to_string_pretty(w)?)?;
+    let json = serde_json::to_string_pretty(w)?;
+    write_atomic(&f, json.as_bytes())?;
     Ok(())
 }
 fn delete_task_file(id: &str) -> Result<()> {
@@ -912,11 +981,7 @@ fn ensure_git_excluded(repo: &Path, name: &str) {
 fn stamp_schema_version() {
     let mut s = settings_load();
     s.schema_version = TASKS_SCHEMA_VERSION;
-    if let Ok(f) = settings_file() {
-        if let Ok(txt) = serde_json::to_string_pretty(&s) {
-            let _ = fs::write(f, txt);
-        }
-    }
+    let _ = save_settings_inner(&s);
 }
 
 /// One-time flip of `cli_enabled` to true for profiles that predate the CLI
@@ -4399,9 +4464,7 @@ fn agent_sandbox_add_allowed_path(agent_id: String, path: String) -> Result<(), 
     if !a.sandbox_allowed_paths.iter().any(|p| p == &stored) {
         a.sandbox_allowed_paths.push(stored);
     }
-    let f = settings_file().map_err(|e| e.to_string())?;
-    fs::write(f, serde_json::to_string_pretty(&s).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    Ok(())
+    save_settings_inner(&s)
 }
 
 #[tauri::command]
@@ -4413,9 +4476,7 @@ fn agent_sandbox_add_allowed_host(agent_id: String, host: String) -> Result<(), 
     if !a.sandbox_allowed_hosts.iter().any(|h| h == &host) {
         a.sandbox_allowed_hosts.push(host);
     }
-    let f = settings_file().map_err(|e| e.to_string())?;
-    fs::write(f, serde_json::to_string_pretty(&s).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    Ok(())
+    save_settings_inner(&s)
 }
 
 /// Append a host to the task's `sandbox_allowed_hosts` list and
@@ -9589,11 +9650,7 @@ pub(crate) fn load_settings_inner() -> Settings {
     // a read-only filesystem or transient I/O error shouldn't fail the
     // load (in-memory state is still correct).
     if migrated {
-        if let Ok(f) = settings_file() {
-            if let Ok(serialized) = serde_json::to_string_pretty(&s) {
-                let _ = fs::write(f, serialized);
-            }
-        }
+        let _ = save_settings_inner(&s);
     }
     s
 }
@@ -9646,8 +9703,8 @@ fn settings_save(app: AppHandle, s: Settings) -> Result<(), String> {
 /// Settings UI does, instead of growing a second encoder that could drift.
 pub(crate) fn save_settings_inner(s: &Settings) -> Result<(), String> {
     let f = settings_file().map_err(|e| e.to_string())?;
-    fs::write(f, serde_json::to_string_pretty(s).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())
+    let json = serde_json::to_string_pretty(s).map_err(|e| e.to_string())?;
+    write_atomic(&f, json.as_bytes()).map_err(|e| e.to_string())
 }
 
 /// Hide (`dismissed = true`) or restore (`false`) a discovered repo from the
@@ -9684,9 +9741,7 @@ fn agents_save(agents: Vec<Agent>) -> Result<(), String> {
     // lookups). If duplicates, keep the first occurrence.
     let mut seen = std::collections::HashSet::new();
     s.agents = agents.into_iter().filter(|a| seen.insert(a.id.clone())).collect();
-    let f = settings_file().map_err(|e| e.to_string())?;
-    fs::write(f, serde_json::to_string_pretty(&s).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())
+    save_settings_inner(&s)
 }
 
 // ───────────────────────────── custom themes ─────────────────────────────
@@ -13020,5 +13075,124 @@ mod tests {
                        "created":"2026-01-01T00:00:00Z","archived":false}"#;
         let t: Task = serde_json::from_str(json).expect("legacy task file still parses");
         assert_eq!(t.order, None);
+    }
+
+    // ── write_atomic (the settings.json / projects.json / task writer) ──
+
+    #[test]
+    fn write_atomic_replaces_the_whole_file_with_no_stale_tail() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("settings.json");
+        write_atomic(&f, b"{\"a\":1,\"padding\":\"xxxxxxxxxxxxxxxxxxxx\"}").unwrap();
+        // A shorter payload over a longer one: proof it's a replace, not an
+        // in-place overwrite that could leave the old bytes past the new end.
+        write_atomic(&f, b"{\"a\":2}").unwrap();
+        assert_eq!(fs::read_to_string(&f).unwrap(), "{\"a\":2}");
+    }
+
+    #[test]
+    fn write_atomic_leaves_no_temp_files_behind() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("settings.json");
+        write_atomic(&f, b"one").unwrap();
+        write_atomic(&f, b"two").unwrap();
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["settings.json"], "staging files must be renamed away, not accumulate");
+    }
+
+    // The whole point: a reader can never observe a partial file. With plain
+    // fs::write the truncate and the write are separate steps, so an
+    // interleaved read can catch an empty or half-length file. Here every
+    // observation must be one of the two complete payloads.
+    #[test]
+    fn write_atomic_never_exposes_a_partial_file_to_a_concurrent_reader() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("settings.json");
+        let small = "s".repeat(64);
+        let big = "b".repeat(256 * 1024);
+        write_atomic(&f, small.as_bytes()).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (f, stop) = (f.clone(), stop.clone());
+            thread::spawn(move || {
+                let mut seen_partial = None;
+                while !stop.load(Ordering::Relaxed) {
+                    // A missing file would also be a torn observation; rename
+                    // means the path is never unlinked, so this must succeed.
+                    let got = fs::read_to_string(&f).expect("path is never absent mid-write");
+                    if !got.chars().all(|c| c == 's') && !got.chars().all(|c| c == 'b') {
+                        seen_partial = Some(got.len());
+                        break;
+                    }
+                    if got.len() != 64 && got.len() != 256 * 1024 {
+                        seen_partial = Some(got.len());
+                        break;
+                    }
+                }
+                seen_partial
+            })
+        };
+        for i in 0..40 {
+            let body = if i % 2 == 0 { &big } else { &small };
+            write_atomic(&f, body.as_bytes()).unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert_eq!(reader.join().unwrap(), None, "reader saw a torn file");
+    }
+
+    // fs::write reused the destination inode and left its mode alone. A
+    // temp-file swap creates a NEW inode (0666 & ~umask), so without carrying
+    // permissions over, a hardened settings.json silently widens to 0644 on the
+    // next preference change — agents[].env holds API keys for some users.
+    #[test]
+    fn write_atomic_preserves_the_destination_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("settings.json");
+        fs::write(&f, b"old").unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o600)).unwrap();
+        write_atomic(&f, b"new").unwrap();
+        let mode = fs::metadata(&f).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "atomic swap must not relax a tightened file");
+        assert_eq!(fs::read_to_string(&f).unwrap(), "new");
+    }
+
+    // A settings.json symlinked into a dotfiles repo is a real setup. fs::write
+    // followed the link; a naive rename would replace the link with a regular
+    // file and the repo copy would go stale forever, silently.
+    #[test]
+    fn write_atomic_writes_through_a_symlinked_destination() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("dotfiles-settings.json");
+        let link = dir.path().join("settings.json");
+        fs::write(&target, b"old").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        write_atomic(&link, b"new").unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            "the link itself must survive");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new", "target must receive the write");
+    }
+
+    #[test]
+    fn write_atomic_keeps_the_old_file_and_cleans_up_when_the_write_fails() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("settings.json");
+        write_atomic(&f, b"good").unwrap();
+        // A directory at the destination makes the rename fail after the temp
+        // file is already written — the error path we most need to be clean.
+        let blocked = dir.path().join("blocked.json");
+        fs::create_dir(&blocked).unwrap();
+        assert!(write_atomic(&blocked, b"nope").is_err());
+        assert_eq!(fs::read_to_string(&f).unwrap(), "good", "unrelated file untouched");
+        let strays: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(strays.is_empty(), "failed write left staging files: {strays:?}");
     }
 }
