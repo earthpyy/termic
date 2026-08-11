@@ -27,7 +27,7 @@ import { useShortcuts } from "@/hooks/useShortcuts";
 import { useAttentionNotifier } from "@/hooks/useAttentionNotifier";
 import { useIsFullscreen } from "@/hooks/useIsFullscreen";
 import { useUpdate } from "@/store/update";
-import { usePrefs } from "@/store/prefs";
+import { syncPrefsFromDisk, usePrefs } from "@/store/prefs";
 import { focusMainTab } from "@/lib/tabFocus";
 
 export function App() {
@@ -73,6 +73,12 @@ export function App() {
     // one at module load — this fetch populates the picker list and
     // reconciles the selection against the folder (edited / deleted file).
     usePrefs.getState().loadCustomThemes();
+
+    // Same shape for the prefs themselves: the localStorage mirror already
+    // painted them at module load, and this reconciles against
+    // settings.json (the synced source of truth). A no-op on a normal
+    // launch. See lib/prefsPersist.ts.
+    void syncPrefsFromDisk();
 
     // Hydrate spotlight state from Rust (survives hot-reloads).
     taskSpotlightStatus().then(map => {

@@ -220,6 +220,10 @@ no metered markup, no backend daemon. Here's what the window gives you on top:
   finder, find-in-files, and the diff view span every member.
 - **Broadcast & Brainstorm.** Send a single prompt to every agent in a workspace concurrently (⇧⌘B). Perfect for multi-agent code reviews, architectural brainstorming, or getting four "second opinions" on a complex bug in seconds.
 - **Config as Code (`.termic.yaml`).** Persist all project-specific settings—setup scripts, run commands, preview URLs, and sandbox allowlists—into a `.termic.yaml` file. Commit it to your repo so your whole team gets the same optimized agent environment instantly.
+- **All your settings in one file.** Agents, sandbox defaults, fonts, theme,
+  and rebound shortcuts live in `settings.json`
+  (`~/Library/Application Support/termic/` on macOS, `~/.local/share/termic/`
+  on Linux). Sorted keys, so it diffs cleanly in a dotfiles repo.
 - **Per-workspace sandbox** (macOS). Filesystem + network cage via
   `sandbox-exec` and an in-process HTTPS CONNECT proxy with a hostname
   allowlist. Lets the agent run with `--dangerously-skip-permissions`

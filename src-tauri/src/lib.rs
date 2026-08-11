@@ -8925,6 +8925,20 @@ pub struct Settings {
     /// pre-filled, not off, so upgraders keep the original behavior.
     #[serde(default = "default_worktree_symlink_paths")]
     pub worktree_symlink_paths: Vec<String>,
+    /// Frontend UI preferences (fonts, theme, terminal renderer, shortcut
+    /// overrides, ...). Deliberately untyped here: every one of these is
+    /// parsed, clamped and defaulted in TypeScript already (`store/prefs.ts`),
+    /// so mirroring the shape in Rust would only create a second definition to
+    /// keep in sync. Rust just round-trips the blob.
+    ///
+    /// `serde_json::Map` is a BTreeMap, so keys serialize in sorted order and
+    /// the file stays diff-stable across machines - it exists to be synced.
+    ///
+    /// Written ONLY by `prefs_save`, which merges key-by-key. `settings_save`
+    /// preserves whatever is on disk rather than taking the caller's copy (see
+    /// there), so the Settings UI can never clobber prefs with a stale read.
+    #[serde(default)]
+    pub prefs: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Whether the pre-create base fetch (GH #79) is enabled. Default-on: only an
@@ -9564,8 +9578,13 @@ fn run_capture_command(cmd: String, cwd: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn settings_save(app: AppHandle, s: Settings) -> Result<(), String> {
+fn settings_save(app: AppHandle, mut s: Settings) -> Result<(), String> {
     let tray_on = tray_enabled_pref(&s);
+    // `prefs` is owned by `prefs_save`, not by this object. The Settings UI
+    // loads the whole struct once and saves it back on every edit, so a
+    // pref changed after that load (a font-size drag, a theme switch) would
+    // otherwise be rolled back by an unrelated toggle. Always take disk's copy.
+    s.prefs = load_settings_inner().prefs;
     save_settings_inner(&s)?;
     // Applies live: flipping the toggle in Settings shouldn't need a restart
     // to show/hide the menu-bar item, matching close_action/cli_enabled's
@@ -9581,6 +9600,21 @@ pub(crate) fn save_settings_inner(s: &Settings) -> Result<(), String> {
     let f = settings_file().map_err(|e| e.to_string())?;
     fs::write(f, serde_json::to_string_pretty(s).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())
+}
+
+/// Persist frontend UI preferences into `settings.json`'s `prefs` object.
+///
+/// Read-modify-write, and MERGES key by key rather than replacing the object:
+/// the frontend debounces these writes and sends only the keys that changed,
+/// so a merge keeps a key this build doesn't know about (an older/newer
+/// profile, a machine that synced the file in) instead of dropping it.
+#[tauri::command]
+fn prefs_save(patch: serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    let mut s = load_settings_inner();
+    for (k, v) in patch {
+        s.prefs.insert(k, v);
+    }
+    save_settings_inner(&s)
 }
 
 /// Hide (`dismissed = true`) or restore (`false`) a discovered repo from the
@@ -10969,7 +11003,7 @@ pub fn run() {
             task_rename, project_rename,
             pty_spawn, pty_write, pty_resize, pty_kill,
             notify, open_path, reveal_path, open_file_external, home_dir, default_shell, path_exists, path_is_git_repo, log_line, pty_debug_append, terminal_stage_file, install_notification_sound, play_completion_sound,
-            settings_load, settings_save, discovery_dismiss, agents_save, agents_defaults, run_capture_command, discover_repos, detect_clis,
+            settings_load, settings_save, prefs_save, discovery_dismiss, agents_save, agents_defaults, run_capture_command, discover_repos, detect_clis,
             automation::automation_result,
             automation::automation_armed,
             pty_alive,

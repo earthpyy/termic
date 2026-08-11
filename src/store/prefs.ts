@@ -1,6 +1,12 @@
 // User-visible UI preferences (separate from app data and transient UI state).
-// Persisted to localStorage so they survive launches. Currently just the mono
-// font, but built for future things (themes, terminal opacity, etc.).
+//
+// Persisted to `settings.json`'s `prefs` object, with localStorage as a
+// synchronous mirror so the initial values below (read at module-eval time,
+// before the first frame) don't need an async IPC round trip. Writes go
+// through `savePref`; lib/prefsPersist.ts owns both halves and documents the
+// arrangement. Keep every setter routed through it — a bare
+// `localStorage.setItem` here would persist on this machine only and get
+// reverted the next time the file syncs in.
 
 import { create } from "zustand";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -15,6 +21,7 @@ import {
   type BindingMap,
   type ShortcutId,
 } from "@/lib/shortcuts";
+import { hydratePrefs, savePref, withoutPersist, type PrefKey } from "@/lib/prefsPersist";
 import {
   DEFAULT_COMPLETION_SOUND_ID,
   LS_COMPLETION_SOUND,
@@ -703,7 +710,7 @@ function loadShortcuts(): BindingMap {
 }
 
 function persistShortcuts(map: BindingMap) {
-  try { localStorage.setItem(LS_SHORTCUTS, JSON.stringify(map)); } catch {}
+  savePref(LS_SHORTCUTS, JSON.stringify(map));
 }
 
 /** Factory defaults for the Appearance section — single source of
@@ -831,42 +838,42 @@ export const usePrefs = create<PrefsState>(set => ({
   splitPaneDimAmount: Math.max(0, Math.min(100, Math.round(lsGetNum(LS_PANE_DIM_AMT, 10)))),
 
   setEditorFontId: (id) => {
-    try { localStorage.setItem(LS_EDITOR_FONT, id); } catch {}
+    savePref(LS_EDITOR_FONT, id);
     applyEditorFont(id);
     set({ editorFontId: id });
   },
   setEditorThemeIdDark: (id) => {
-    try { localStorage.setItem(LS_EDITOR_THEME, id); } catch {}
+    savePref(LS_EDITOR_THEME, id);
     set({ editorThemeIdDark: id });
   },
   setEditorThemeIdLight: (id) => {
-    try { localStorage.setItem(LS_EDITOR_THEME_LIGHT, id); } catch {}
+    savePref(LS_EDITOR_THEME_LIGHT, id);
     set({ editorThemeIdLight: id });
   },
   setTerminalFontId: (id) => {
-    try { localStorage.setItem(LS_TERMINAL_FONT, id); } catch {}
+    savePref(LS_TERMINAL_FONT, id);
     // Terminal font does NOT touch --font-mono (which the editor uses);
     // it's read by xterm directly via currentTerminalStack().
     set({ terminalFontId: id });
   },
   setTerminalFontSize: (px) => {
-    try { localStorage.setItem(LS_TERMINAL_SIZE, String(px)); } catch {}
+    savePref(LS_TERMINAL_SIZE, String(px));
     set({ terminalFontSize: px });
   },
   setTerminalLetterSpacing: (px) => {
     // Clamp to non-negative integer. Fractional values misalign the
     // WebGL atlas; very high values break TUI column math.
     const clamped = Math.max(0, Math.min(6, Math.round(px)));
-    try { localStorage.setItem(LS_TERMINAL_LETTERSPACING, String(clamped)); } catch {}
+    savePref(LS_TERMINAL_LETTERSPACING, String(clamped));
     set({ terminalLetterSpacing: clamped });
   },
   setTerminalScrollback: (n) => {
     const clamped = Math.max(1000, Math.min(100000, Math.round(n)));
-    try { localStorage.setItem(LS_TERMINAL_SCROLLBACK, String(clamped)); } catch {}
+    savePref(LS_TERMINAL_SCROLLBACK, String(clamped));
     set({ terminalScrollback: clamped });
   },
   setTerminalOptionAsMeta: (v) => {
-    try { localStorage.setItem(LS_TERMINAL_OPTION_AS_META, v ? "1" : "0"); } catch {}
+    savePref(LS_TERMINAL_OPTION_AS_META, v ? "1" : "0");
     set({ terminalOptionAsMeta: v });
   },
   // The boolean and the three-way pref are two views of one setting, so both
@@ -876,31 +883,27 @@ export const usePrefs = create<PrefsState>(set => ({
   // canvas: "on" has always meant the GPU fast path.
   setTerminalGpuEnabled: (v) => {
     const kind: TerminalRendererKind = v ? "webgl" : "dom";
-    try {
-      localStorage.setItem(LS_TERMINAL_GPU, v ? "1" : "0");
-      localStorage.setItem(LS_TERMINAL_RENDERER, kind);
-    } catch {}
+    savePref(LS_TERMINAL_GPU, v ? "1" : "0");
+    savePref(LS_TERMINAL_RENDERER, kind);
     set({ terminalGpuEnabled: v, terminalRenderer: kind });
   },
   setTerminalRenderer: (v) => {
     const gpu = v === "webgl";
-    try {
-      localStorage.setItem(LS_TERMINAL_RENDERER, v);
-      localStorage.setItem(LS_TERMINAL_GPU, gpu ? "1" : "0");
-    } catch {}
+    savePref(LS_TERMINAL_RENDERER, v);
+    savePref(LS_TERMINAL_GPU, gpu ? "1" : "0");
     set({ terminalRenderer: v, terminalGpuEnabled: gpu });
   },
   setTerminalCopyOnSelect: (v) => {
-    try { localStorage.setItem(LS_TERMINAL_COPY_ON_SELECT, v ? "1" : "0"); } catch {}
+    savePref(LS_TERMINAL_COPY_ON_SELECT, v ? "1" : "0");
     set({ terminalCopyOnSelect: v });
   },
   setEditorFontSize: (px) => {
-    try { localStorage.setItem(LS_EDITOR_SIZE, String(px)); } catch {}
+    savePref(LS_EDITOR_SIZE, String(px));
     set({ editorFontSize: px });
   },
   setUiScale: (pct) => {
     const clamped = clampUiScale(pct);
-    try { localStorage.setItem(LS_UI_SCALE, String(clamped)); } catch {}
+    savePref(LS_UI_SCALE, String(clamped));
     applyUiScale(clamped);
     set({ uiScale: clamped });
   },
@@ -908,11 +911,11 @@ export const usePrefs = create<PrefsState>(set => ({
     usePrefs.getState().setUiScale(usePrefs.getState().uiScale + dir * UI_SCALE_STEP);
   },
   setCodeLigatures: (v) => {
-    try { localStorage.setItem(LS_LIGATURES, v ? "1" : "0"); } catch {}
+    savePref(LS_LIGATURES, v ? "1" : "0");
     set({ codeLigatures: v });
   },
   setShowAllInstalledFonts: (v) => {
-    try { localStorage.setItem(LS_SHOW_ALL_FONTS, v ? "1" : "0"); } catch {}
+    savePref(LS_SHOW_ALL_FONTS, v ? "1" : "0");
     set({ showAllInstalledFonts: v });
   },
   resetAppearance: () => {
@@ -939,7 +942,7 @@ export const usePrefs = create<PrefsState>(set => ({
       const theme = usePrefs.getState().customThemes.find(t => t.id === m);
       if (theme) writeThemeCache(theme);
     }
-    try { localStorage.setItem(LS_THEME, m); } catch {}
+    savePref(LS_THEME, m);
     applyTheme(m);
     set({ themeMode: m });
   },
@@ -970,76 +973,76 @@ export const usePrefs = create<PrefsState>(set => ({
     }
   },
   setDesktopNotifications: (v) => {
-    try { localStorage.setItem(LS_DESKTOPNOTIF, v ? "1" : "0"); } catch {}
+    savePref(LS_DESKTOPNOTIF, v ? "1" : "0");
     set({ desktopNotifications: v });
   },
   setCompletionSound: (v) => {
-    try { localStorage.setItem(LS_COMPLETION_SOUND, v ? "1" : "0"); } catch {}
+    savePref(LS_COMPLETION_SOUND, v ? "1" : "0");
     set({ completionSound: v });
   },
   setCompletionSoundId: (id) => {
     const next = isCompletionSoundId(id) ? id : DEFAULT_COMPLETION_SOUND_ID;
-    try { localStorage.setItem(LS_COMPLETION_SOUND_ID, next); } catch {}
+    savePref(LS_COMPLETION_SOUND_ID, next);
     set({ completionSoundId: next });
   },
   setSettledHighlight: (v) => {
-    try { localStorage.setItem(LS_SETTLED_HIGHLIGHT, v ? "1" : "0"); } catch {}
+    savePref(LS_SETTLED_HIGHLIGHT, v ? "1" : "0");
     set({ settledHighlight: v });
   },
   setConfirmBeforeCloseAgentTab: (v) => {
-    try { localStorage.setItem(LS_CONFIRM_CLOSE_AGENT_TAB, v ? "1" : "0"); } catch {}
+    savePref(LS_CONFIRM_CLOSE_AGENT_TAB, v ? "1" : "0");
     set({ confirmBeforeCloseAgentTab: v });
   },
   setWorkingIndicator: (v) => {
-    try { localStorage.setItem(LS_WORKING_INDICATOR, v ? "1" : "0"); } catch {}
+    savePref(LS_WORKING_INDICATOR, v ? "1" : "0");
     set({ workingIndicator: v });
   },
   setLoadRemoteImages: (v) => {
-    try { localStorage.setItem(LS_LOAD_REMOTE_IMAGES, v ? "1" : "0"); } catch {}
+    savePref(LS_LOAD_REMOTE_IMAGES, v ? "1" : "0");
     set({ loadRemoteImages: v });
   },
   setGlobalDefaultSandbox: (v) => {
-    try { localStorage.setItem(LS_DEFAULT_SANDBOX, v ? "1" : "0"); } catch {}
+    savePref(LS_DEFAULT_SANDBOX, v ? "1" : "0");
     set({ globalDefaultSandbox: v });
   },
   setSandboxBypassPermissions: (v) => {
-    try { localStorage.setItem(LS_SANDBOX_BYPASS, v ? "1" : "0"); } catch {}
+    savePref(LS_SANDBOX_BYPASS, v ? "1" : "0");
     set({ sandboxBypassPermissions: v });
   },
   setAllowScope: (s) => {
-    try { localStorage.setItem(LS_ALLOW_SCOPE, s); } catch {}
+    savePref(LS_ALLOW_SCOPE, s);
     set({ allowScope: s });
   },
   setTaskExpandMode: (m) => {
-    try { localStorage.setItem(LS_TASK_EXPAND_MODE, m); } catch {}
+    savePref(LS_TASK_EXPAND_MODE, m);
     set({ taskExpandMode: m });
   },
   setHideInactiveProjects: (v) => {
-    try { localStorage.setItem(LS_HIDE_INACTIVE_PROJECTS, v ? "1" : "0"); } catch {}
+    savePref(LS_HIDE_INACTIVE_PROJECTS, v ? "1" : "0");
     set({ hideInactiveProjects: v });
   },
   setMarkdownDefaultView: (v) => {
-    try { localStorage.setItem(LS_MD_VIEW, v); } catch {}
+    savePref(LS_MD_VIEW, v);
     set({ markdownDefaultView: v });
   },
   setBranchPrefix: (v) => {
     // Store as-typed (normalization happens at the use site in
     // NewTaskDialog) so a trailing "/" isn't stripped mid-keystroke.
-    try { localStorage.setItem(LS_BRANCH_PREFIX, v); } catch {}
+    savePref(LS_BRANCH_PREFIX, v);
     set({ branchPrefix: v });
   },
   setQueueMinIntervalMs: (ms) => {
     const clamped = Math.max(0, Math.min(120000, Math.round(ms)));
-    try { localStorage.setItem(LS_QUEUE_MIN_INTERVAL, String(clamped)); } catch {}
+    savePref(LS_QUEUE_MIN_INTERVAL, String(clamped));
     set({ queueMinIntervalMs: clamped });
   },
   setSplitPaneDim: (v) => {
-    try { localStorage.setItem(LS_PANE_DIM, v ? "1" : "0"); } catch {}
+    savePref(LS_PANE_DIM, v ? "1" : "0");
     set({ splitPaneDim: v });
   },
   setSplitPaneDimAmount: (v) => {
     const clamped = Math.max(0, Math.min(100, Math.round(v)));
-    try { localStorage.setItem(LS_PANE_DIM_AMT, String(clamped)); } catch {}
+    savePref(LS_PANE_DIM_AMT, String(clamped));
     set({ splitPaneDimAmount: clamped });
   },
   setShortcut: (id, binding) => {
@@ -1064,11 +1067,114 @@ export const usePrefs = create<PrefsState>(set => ({
     const order: ThemeMode[] = ["auto", "light", "dark"];
     const cur = usePrefs.getState().themeMode;
     const next = order[(order.indexOf(cur) + 1) % order.length];
-    try { localStorage.setItem(LS_THEME, next); } catch {}
+    savePref(LS_THEME, next);
     applyTheme(next);
     set({ themeMode: next });
   },
 }));
+
+/** Reconcile the live store with `settings.json` after boot.
+ *
+ *  The store was already built from the localStorage mirror (synchronously,
+ *  before first paint), so on a normal launch this finds nothing and returns
+ *  without touching anything. It does work in exactly two cases: the first
+ *  launch after the file synced in from another machine, and the first launch
+ *  of a profile that predates disk-backed prefs (which seeds the file instead).
+ *
+ *  Every value is replayed through its own setter so the side effects that
+ *  make a pref visible still run (applyTheme, applyEditorFont, applyUiScale)
+ *  and the clamps still apply to a hand-edited file. `withoutPersist` stops
+ *  that replay from writing the values straight back to the file they came
+ *  from. */
+export async function syncPrefsFromDisk(): Promise<void> {
+  const changed = await hydratePrefs();
+  const keys = Object.keys(changed) as PrefKey[];
+  if (keys.length === 0) return;
+
+  const s   = usePrefs.getState();
+  const str = (k: PrefKey) => changed[k] ?? "";
+  const bln = (k: PrefKey) => changed[k] === "1";
+  const num = (k: PrefKey) => Number(changed[k]);
+
+  withoutPersist(() => {
+    for (const k of keys) {
+      switch (k) {
+        case "editorFont":            s.setEditorFontId(str(k)); break;
+        case "editorThemeId":         s.setEditorThemeIdDark(str(k)); break;
+        case "editorThemeIdLight":    s.setEditorThemeIdLight(str(k)); break;
+        case "terminalFont":          s.setTerminalFontId(str(k)); break;
+        case "terminalFontSize":      s.setTerminalFontSize(num(k)); break;
+        case "editorFontSize":        s.setEditorFontSize(num(k)); break;
+        case "uiScale":               s.setUiScale(num(k)); break;
+        case "codeLigatures":         s.setCodeLigatures(bln(k)); break;
+        case "showAllInstalledFonts": s.setShowAllInstalledFonts(bln(k)); break;
+        case "themeMode":             s.setThemeMode(parseThemeMode(str(k))); break;
+        case "terminalLetterSpacing": s.setTerminalLetterSpacing(num(k)); break;
+        case "terminalScrollback":    s.setTerminalScrollback(num(k)); break;
+        case "terminalOptionAsMeta":  s.setTerminalOptionAsMeta(bln(k)); break;
+        case "terminalRenderer":
+          s.setTerminalRenderer(parseTerminalRenderer(str(k), s.terminalRenderer));
+          break;
+        case "terminalGpuEnabled":
+          // The renderer setter writes both halves of this pair, so applying
+          // the boolean too would just undo it. Only honour it when it's the
+          // only one of the two that moved (a file written before the
+          // three-way pref existed).
+          if (!("terminalRenderer" in changed)) s.setTerminalGpuEnabled(bln(k));
+          break;
+        case "terminalCopyOnSelect":  s.setTerminalCopyOnSelect(bln(k)); break;
+        case "desktopNotifications":  s.setDesktopNotifications(bln(k)); break;
+        case "completionSound":       s.setCompletionSound(bln(k)); break;
+        case "completionSoundId":
+          if (isCompletionSoundId(str(k))) s.setCompletionSoundId(str(k) as CompletionSoundId);
+          break;
+        case "settledHighlight":      s.setSettledHighlight(bln(k)); break;
+        case "workingIndicator":      s.setWorkingIndicator(bln(k)); break;
+        case "confirmBeforeCloseAgentTab": s.setConfirmBeforeCloseAgentTab(bln(k)); break;
+        case "loadRemoteImages":      s.setLoadRemoteImages(bln(k)); break;
+        case "hideInactiveProjects":  s.setHideInactiveProjects(bln(k)); break;
+        case "branchPrefix":          s.setBranchPrefix(str(k)); break;
+        case "queueMinIntervalMs":    s.setQueueMinIntervalMs(num(k)); break;
+        case "splitPaneDim":          s.setSplitPaneDim(bln(k)); break;
+        case "splitPaneDimAmount":    s.setSplitPaneDimAmount(num(k)); break;
+        case "globalDefaultSandbox":  s.setGlobalDefaultSandbox(bln(k)); break;
+        case "sandboxBypassPermissions": s.setSandboxBypassPermissions(bln(k)); break;
+        case "taskExpandMode": {
+          const v = str(k);
+          if (v === "chevron" || v === "click" || v === "always") s.setTaskExpandMode(v);
+          break;
+        }
+        case "markdownDefaultView": {
+          const v = str(k);
+          if (v === "source" || v === "preview" || v === "split") s.setMarkdownDefaultView(v);
+          break;
+        }
+        case "sandboxAllowScope": {
+          const v = str(k);
+          // No setter clears this back to null, and null is the meaningful
+          // "never chosen" state, so write it directly rather than inventing one.
+          usePrefs.setState({
+            allowScope: v === "agent" || v === "project" || v === "repo" ? v : null,
+          });
+          break;
+        }
+        case "shortcutBindings":
+          // loadShortcuts re-reads the mirror hydratePrefs just updated, so it
+          // gets the same merge-onto-defaults and per-entry validation a cold
+          // boot would.
+          usePrefs.setState({ shortcuts: loadShortcuts() });
+          break;
+        default: {
+          // Compile-time guard: a key added to PREF_KINDS without a case here
+          // would persist fine but never apply on the machine syncing it in,
+          // which is the silent half of the bug. Fails the build instead.
+          const unhandled: never = k;
+          void unhandled;
+        }
+      }
+    }
+  });
+}
 
 /** Legacy resolver kept for callers that only care about light-vs-dark
  *  (toolbar icon swap, editor auto, COLORFGBG, system colorScheme hint).

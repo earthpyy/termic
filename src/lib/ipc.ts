@@ -522,7 +522,12 @@ export const themesList = () => invoke<CustomThemeFile[]>("themes_list");
 /** Ensure + return the custom themes directory (absolute path), for the
  *  picker's "Open themes folder" row. */
 export const themesDir  = () => invoke<string>("themes_dir");
+/** Note: the backend ignores `s.prefs` and keeps the copy already on disk.
+ *  UI preferences go through `prefsSave`; see lib/prefsPersist.ts. */
 export const settingsSave  = (s: Settings) => invoke<void>("settings_save", { s });
+/** Merge UI preferences into `settings.json`'s `prefs` object, key by key.
+ *  Send only what changed — absent keys are left alone. */
+export const prefsSave     = (patch: Record<string, unknown>) => invoke<void>("prefs_save", { patch });
 export const agentsSave    = (agents: Agent[]) => invoke<void>("agents_save", { agents });
 export const discoverRepos = (dir: string) => invoke<DiscoveredRepo[]>("discover_repos", { dir });
 /** Hide (`dismissed=true`) or restore (`false`) a discovered repo from the

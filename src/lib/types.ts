@@ -484,6 +484,13 @@ export interface Settings {
    *  omits it). Pre-filled with the common agent dirs; an empty list disables
    *  the linking. Absent = the pre-filled defaults, not off. */
   worktree_symlink_paths?: string[];
+  /** Frontend UI preferences (fonts, theme, terminal renderer, shortcut
+   *  overrides, ...), keyed by the localStorage names in store/prefs.ts.
+   *  READ-ONLY through this object: `settings_save` discards whatever it is
+   *  sent here and keeps the on-disk copy, so an unrelated Settings toggle
+   *  can't roll back a pref changed since the UI loaded. Write via
+   *  `prefsSave` / lib/prefsPersist.ts. */
+  prefs?: Record<string, unknown>;
 }
 
 /** Install state of the bundled CLI on PATH (cli_install_status). */
