@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import os from "node:os";
 import path from "node:path";
 import { dataDir } from "../../wdio.conf.js";
-import { archiveTask, clickWhenVisible, dismissOverlays, openTask, pointerDrag, requireTermicApi, snap, waitForAppShell, waitForText, waitForTextGone, waitVisible } from "../helpers";
+import { archiveTask, clickWhenVisible, createWorktreeTask, dismissOverlays, openTask, pointerDrag, requireTermicApi, snap, waitForAppShell, waitForText, waitForTextGone, waitVisible } from "../helpers";
 
 /** Click the [role="switch"] in the settings row whose label matches exactly.
  *  Toggle rows are label + switch inside one .justify-between wrapper
@@ -1690,6 +1690,246 @@ describe("default tasks path", () => {
       { timeout: 5_000, timeoutMsg: "an empty required path was still saveable" },
     );
     await snap("default-tasks-path-settings.png");
+  });
+});
+
+// Task port range (GH #271). The setting is two boxes in Settings → Tasks,
+// but the FEATURE is where a new task's ports land, so the spec drives the
+// real form and then creates a real task to see the range honoured. Restores
+// the default range in teardown: every later spec that creates a task would
+// otherwise allocate from whatever this one left behind.
+describe("task port range", () => {
+  const tasks: string[] = [];
+
+  const readRange = () =>
+    browser.execute(async () => {
+      const s = await window.__termic!.ipc.settingsLoad();
+      return [s.task_port_range_start, s.task_port_range_end];
+    });
+  const setRange = (start: number, end: number) =>
+    browser.execute(async (a, b) => {
+      const t = window.__termic!;
+      const s = await t.ipc.settingsLoad();
+      await t.ipc.settingsSave({ ...s, task_port_range_start: a, task_port_range_end: b });
+    }, start, end);
+  /** Drive one of the two boxes the way a keystroke does (React needs the
+   *  native setter, not a direct `.value =`). */
+  const type = (testid: string, value: string) =>
+    browser.execute((id, v) => {
+      const input = document.querySelector(`[data-testid="${id}"]`) as HTMLInputElement;
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype, "value",
+      )!.set!;
+      setter.call(input, v);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }, testid, value);
+  const errorText = () =>
+    browser.execute(() => (document.querySelector(
+      '[data-testid="task-port-range-error"]',
+    ) as HTMLElement | null)?.textContent ?? "");
+  const capacityText = () =>
+    browser.execute(() => (document.querySelector(
+      '[data-testid="task-port-range-capacity"]',
+    ) as HTMLElement | null)?.textContent ?? "");
+  /** By text, so it can't collide with the other Save buttons on the page. */
+  const saveButton = () =>
+    browser.execute(() => {
+      const btn = [...document.querySelectorAll("button")].find(
+        (b) => b.textContent?.trim() === "Save port range",
+      ) as HTMLButtonElement | undefined;
+      if (!btn) throw new Error("no 'Save port range' button");
+      return { disabled: btn.disabled };
+    });
+  const clickSave = () =>
+    browser.execute(() => {
+      const btn = [...document.querySelectorAll("button")].find(
+        (b) => b.textContent?.trim() === "Save port range",
+      ) as HTMLButtonElement;
+      btn.click();
+    });
+
+  before(async () => {
+    await waitForAppShell();
+    requireTermicApi();
+  });
+
+  after(async () => {
+    // DELETE, not archive: archived tasks stay in History, and task.e2e.ts
+    // later empties the whole archive under a 15s budget that four of these
+    // (two with real worktrees to rm -rf) can blow. Sweep by name too, since
+    // a throw part way through leaves a task created and its id unreturned.
+    await browser.execute(async (ids) => {
+      const t = window.__termic!;
+      const doomed = new Set<string>(ids);
+      for (const w of t.useApp.getState().tasks as any[]) {
+        if (w.name?.startsWith("port-range-")) doomed.add(w.id);
+      }
+      for (const id of doomed) {
+        try { await t.ipc.taskDelete(id); } catch { /* already gone */ }
+      }
+      await t.useApp.getState().loadAll();
+      t.useApp.getState().closeSettings();
+    }, tasks);
+    await setRange(18100, 65535);
+    // Archiving takes the worktrees; the branches they cut are ours to
+    // remove, or the next run's git panel boots on a dirty fixture.
+    const root = await browser.execute(() =>
+      window.__termic!.useApp.getState()
+        .projects.find((p: any) => p.name === "fixture-repo")?.root_path ?? "");
+    if (root) {
+      execSync(`git -C "${root}" worktree prune`, { stdio: "ignore" });
+      for (const b of ["port-range-wt-a", "port-range-wt-b"]) {
+        try { execSync(`git -C "${root}" branch -D ${b}`, { stdio: "ignore" }); } catch { /* never created */ }
+      }
+    }
+  });
+
+  it("refuses a range the allocator could never use, and saves one it can", async () => {
+    await setRange(18100, 65535);
+    await browser.execute(() => window.__termic!.useApp.getState().openSettings("tasks"));
+    await waitVisible('[data-testid="task-port-start-input"]');
+
+    // The boxes carry the real window, not a placeholder over an empty field.
+    const initial = await browser.execute(() => [
+      (document.querySelector('[data-testid="task-port-start-input"]') as HTMLInputElement).value,
+      (document.querySelector('[data-testid="task-port-end-input"]') as HTMLInputElement).value,
+    ]);
+    expect(initial).toEqual(["18100", "65535"]);
+
+    // Privileged start: refused at the form, not deferred to a failed create.
+    await type("task-port-start-input", "80");
+    await browser.waitUntil(
+      async () => (await errorText()).includes("1024") && (await saveButton()).disabled,
+      { timeout: 5_000, timeoutMsg: "a privileged port range was still saveable" },
+    );
+
+    // Inverted, and then too narrow for the 6 ports one task takes: each has
+    // its own sentence, so the user is told which rule they broke.
+    await type("task-port-start-input", "21000");
+    await type("task-port-end-input", "20000");
+    await browser.waitUntil(
+      async () => (await errorText()).includes("below its start") && (await saveButton()).disabled,
+      { timeout: 5_000, timeoutMsg: "an inverted port range was still saveable" },
+    );
+    await type("task-port-end-input", "21004");
+    await browser.waitUntil(
+      async () => (await errorText()).includes("consecutive ports") && (await saveButton()).disabled,
+      { timeout: 5_000, timeoutMsg: "a range too narrow for one block was still saveable" },
+    );
+
+    // A usable one clears the error, previews its capacity and saves.
+    await type("task-port-end-input", "21999");
+    await browser.waitUntil(
+      async () => (await errorText()) === "" && !(await saveButton()).disabled,
+      { timeout: 5_000, timeoutMsg: "a valid port range stayed blocked" },
+    );
+    expect(await capacityText()).toContain("Room for about 166 tasks");
+    await clickSave();
+    await browser.waitUntil(
+      async () => JSON.stringify(await readRange()) === "[21000,21999]",
+      { timeout: 8_000, timeoutMsg: "the port range never reached settings" },
+    );
+    await snap("task-port-range-settings.png");
+
+    // Saved, so the form is clean again: nothing left to save.
+    expect((await saveButton()).disabled).toBe(true);
+  });
+
+  it("allocates a new task's ports from the saved range", async () => {
+    await setRange(21000, 21999);
+    const id = await openTask("port-range-task", false);
+    tasks.push(id);
+    const port = await browser.execute(
+      (i) => window.__termic!.useApp.getState().tasks.find((t: any) => t.id === i)?.port,
+      id,
+    );
+    expect(port).toBeGreaterThanOrEqual(21000);
+    expect(port).toBeLessThanOrEqual(21999);
+  });
+
+  it("keeps an existing task's ports when the range moves away from them", async () => {
+    // The promise the settings copy makes: narrowing the window never
+    // renumbers a task that is already listening somewhere.
+    const existing = tasks[0];
+    const before = await browser.execute(
+      (i) => window.__termic!.useApp.getState().tasks.find((t: any) => t.id === i)?.port,
+      existing,
+    );
+    await setRange(31000, 31999);
+    await browser.execute(() => window.__termic!.useApp.getState().loadAll());
+    const after = await browser.execute(
+      (i) => window.__termic!.useApp.getState().tasks.find((t: any) => t.id === i)?.port,
+      existing,
+    );
+    expect(after).toBe(before);
+
+    // ...and the next task comes from the new window, not the old one.
+    const id = await openTask("port-range-moved", false);
+    tasks.push(id);
+    const port = await browser.execute(
+      (i) => window.__termic!.useApp.getState().tasks.find((t: any) => t.id === i)?.port,
+      id,
+    );
+    expect(port).toBeGreaterThanOrEqual(31000);
+    expect(port).toBeLessThanOrEqual(31999);
+  });
+
+  it("fails the create with a pointed error once the range is full", async () => {
+    // A range holding exactly one plain block: the second create has nowhere
+    // to go, and the message has to name the range and where to widen it.
+    await setRange(41000, 41005);
+    const id = await openTask("port-range-full", false);
+    tasks.push(id);
+    const err = await browser.execute(async () => {
+      const t = window.__termic!;
+      const proj = t.useApp.getState().projects.find((p: any) => p.name === "fixture-repo");
+      try {
+        await t.ipc.taskOpenRepo(proj.id, "fakeagent", "port-range-overflow");
+        return null;
+      } catch (e: any) {
+        return String(e?.message ?? e);
+      }
+    });
+    expect(err).toContain("41000-41005");
+    expect(err).toContain("Settings");
+  });
+
+  // The create path that DOES build something before it allocates: a
+  // worktree task cuts a branch and registers a worktree first. A full
+  // range must unwind both, or widening the range and retrying the same
+  // name dies on "a worktree already lives at …" forever after.
+  it("unwinds the worktree when a worktree task hits a full range", async () => {
+    await setRange(51000, 51005); // exactly one block
+    const first = await createWorktreeTask("port-range-wt-a", "port-range-wt-a", false);
+    tasks.push(first);
+
+    const err = await browser.execute(async () => {
+      const t = window.__termic!;
+      const proj = t.useApp.getState().projects.find((p: any) => p.name === "fixture-repo");
+      try {
+        await t.ipc.taskCreate({
+          project_id: proj.id, name: "port-range-wt-b", cli: "fakeagent",
+          base_branch: "main", branch: "port-range-wt-b",
+        });
+        return null;
+      } catch (e: any) {
+        return String(e?.message ?? e);
+      }
+    });
+    expect(err).toContain("51000-51005");
+
+    // Nothing was left behind: the same name creates cleanly once the
+    // range has room. Before the unwind this failed on the orphaned
+    // worktree, not on ports.
+    await setRange(51000, 52000);
+    const second = await createWorktreeTask("port-range-wt-b", "port-range-wt-b", false);
+    tasks.push(second);
+    const port = await browser.execute(
+      (i) => window.__termic!.useApp.getState().tasks.find((t: any) => t.id === i)?.port,
+      second,
+    );
+    expect(port).toBeGreaterThanOrEqual(51000);
+    expect(port).toBeLessThanOrEqual(52000);
   });
 });
 

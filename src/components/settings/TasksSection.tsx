@@ -15,6 +15,12 @@ import { Input } from "@/components/ui/Input";
 import { usePrefs } from "@/store/prefs";
 import { Block, ListField, SectionTitle, Toggle, useBackendSettings, useTasksPathConflicts } from "./Controls";
 import { cleanLines } from "@/lib/utils";
+import {
+  PORT_RANGE_DEFAULT_END,
+  PORT_RANGE_DEFAULT_START,
+  portRangeCapacity,
+  portRangeError,
+} from "@/lib/portRange";
 
 /** Drop trailing slashes so the "where tasks go" preview never reads
  *  `~/work//<project>`. Keeps a bare `/` intact. */
@@ -39,6 +45,15 @@ export function TasksSection() {
   // the user can see and edit the default rather than guess at it.
   const [tasksPath, setTasksPath] = useState("");
   const [tasksPathOriginal, setTasksPathOriginal] = useState("");
+  // Task port range (GH #271). Held as STRINGS, not numbers: a number input
+  // bound to a number cannot be cleared to retype it, and the validator has
+  // to see the half-typed value to keep Save dead while it is nonsense.
+  // Absent in settings = the built-in default, which the backend also seeds,
+  // so the boxes always show the real window rather than a placeholder.
+  const [portStart, setPortStart] = useState(String(PORT_RANGE_DEFAULT_START));
+  const [portStartOriginal, setPortStartOriginal] = useState(String(PORT_RANGE_DEFAULT_START));
+  const [portEnd, setPortEnd] = useState(String(PORT_RANGE_DEFAULT_END));
+  const [portEndOriginal, setPortEndOriginal] = useState(String(PORT_RANGE_DEFAULT_END));
 
   const branchPrefix = usePrefs(s => s.branchPrefix);
   const setBranchPrefix = usePrefs(s => s.setBranchPrefix);
@@ -64,6 +79,20 @@ export function TasksSection() {
     const p = settings.default_tasks_path ?? "";
     setTasksPath(p);
     setTasksPathOriginal(p);
+    // Show what the ALLOCATOR will use, which for a stored range it
+    // could never allocate from is the built-in default (`PortRange::
+    // is_usable` in lib.rs). `??` alone would render a hand-edited 0 in
+    // the box with a dead Save button while tasks quietly came from
+    // 18100, i.e. the field stating the opposite of the truth.
+    const storedStart = settings.task_port_range_start ?? PORT_RANGE_DEFAULT_START;
+    const storedEnd = settings.task_port_range_end ?? PORT_RANGE_DEFAULT_END;
+    const usable = !portRangeError(storedStart, storedEnd);
+    const ps = String(usable ? storedStart : PORT_RANGE_DEFAULT_START);
+    const pe = String(usable ? storedEnd : PORT_RANGE_DEFAULT_END);
+    setPortStart(ps);
+    setPortStartOriginal(ps);
+    setPortEnd(pe);
+    setPortEndOriginal(pe);
   }, [settings]);
 
   const symlinkDirty = symlinkPaths !== symlinkPathsOriginal;
@@ -90,6 +119,15 @@ export function TasksSection() {
   const conflictNames = conflicts.length > 3
     ? `${conflicts.slice(0, 3).join(", ")}, and ${conflicts.length - 3} more`
     : conflicts.join(", ");
+
+  // Number("") is 0 and Number("3e") is NaN, and both fail the validator on
+  // their own, so the empty and half-typed states need no special case here.
+  const parsedPortStart = Number(portStart);
+  const parsedPortEnd = Number(portEnd);
+  const portRangeIssue = portRangeError(parsedPortStart, parsedPortEnd);
+  const portRangeDirty = portStart !== portStartOriginal || portEnd !== portEndOriginal;
+  const canSavePortRange = portRangeDirty && !portRangeIssue;
+  const portCapacity = portRangeCapacity(parsedPortStart, parsedPortEnd);
 
   async function saveFetchBeforeCreate(v: boolean) {
     setFetchBeforeCreate(v);
@@ -118,6 +156,23 @@ export function TasksSection() {
       if (await patch({ default_tasks_path: trimmedTasksPath })) {
         setTasksPath(trimmedTasksPath);
         setTasksPathOriginal(trimmedTasksPath);
+      }
+    } finally { setBusy(false); }
+  }
+
+  async function savePortRange() {
+    if (!settings || !canSavePortRange) return;
+    setBusy(true);
+    try {
+      if (await patch({
+        task_port_range_start: parsedPortStart,
+        task_port_range_end: parsedPortEnd,
+      })) {
+        // Re-seed from the parsed numbers, so " 3000" stops reading dirty.
+        setPortStart(String(parsedPortStart));
+        setPortStartOriginal(String(parsedPortStart));
+        setPortEnd(String(parsedPortEnd));
+        setPortEndOriginal(String(parsedPortEnd));
       }
     } finally { setBusy(false); }
   }
@@ -179,6 +234,57 @@ export function TasksSection() {
         <div className="mt-3">
           <Button variant="primary" disabled={!canSaveTasksPath || busy} onClick={saveTasksPath}>
             {busy ? "Saving…" : "Save tasks path"}
+          </Button>
+        </div>
+      </Block>
+
+      {/* Task port range (GH #271). Sits under the tasks path because both
+          are "what a new task is given at creation", and both carry the same
+          promise: existing tasks are never moved. The allocator still counts
+          a task outside the window as occupying its ports, so narrowing the
+          range cannot hand a live dev server's port to a new task. */}
+      <Block>
+        <div className="text-[14px] font-medium">Task port range</div>
+        <div className="mt-0.5 text-[12.5px] text-[var(--color-fg-dim)]">
+          The ports new tasks are allocated from. Each task takes a block of consecutive ports: <code className="font-mono">$TERMIC_PORT</code>, one per repo in a multi-repo task, one per extra named port, and a small buffer for names added later. Existing tasks keep the ports they already have (and still hold them against new ones); this applies to the next task you create.
+        </div>
+        <div className="mt-2 flex items-center gap-2">
+          <Input
+            type="number"
+            min={1024}
+            max={65535}
+            value={portStart}
+            onChange={(e) => setPortStart(e.target.value)}
+            className="w-28 font-mono"
+            data-testid="task-port-start-input"
+          />
+          <span className="text-[12.5px] text-[var(--color-fg-dim)]">to</span>
+          <Input
+            type="number"
+            min={1024}
+            max={65535}
+            value={portEnd}
+            onChange={(e) => setPortEnd(e.target.value)}
+            className="w-28 font-mono"
+            data-testid="task-port-end-input"
+          />
+        </div>
+        <div className="mt-1.5 text-[12.5px] text-[var(--color-fg-faint)]">
+          {portRangeIssue
+            ? (
+              <span className="text-[var(--color-err)]" data-testid="task-port-range-error">
+                {portRangeIssue}
+              </span>
+            )
+            : (
+              <span data-testid="task-port-range-capacity">
+                {`Room for about ${portCapacity.toLocaleString()} ${portCapacity === 1 ? "task" : "tasks"}. A task that declares extra named ports takes a wider block than that, and creating one fails once the range is full.`}
+              </span>
+            )}
+        </div>
+        <div className="mt-3">
+          <Button variant="primary" disabled={!canSavePortRange || busy} onClick={savePortRange}>
+            {busy ? "Saving…" : "Save port range"}
           </Button>
         </div>
       </Block>

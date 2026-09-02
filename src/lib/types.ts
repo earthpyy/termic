@@ -727,6 +727,13 @@ export interface Settings {
    *  what lets a user select a browser profile. Projects override it via
    *  `Project.preview_browser`. */
   preview_browser?: string;
+  /** Inclusive window every new task's port block is allocated from (GH #271).
+   *  Absent = the 18100..=65535 the allocator hard-coded before the setting
+   *  existed. Applies to the NEXT task only: existing tasks keep their ports
+   *  and still count as occupied even once they fall outside the window, so
+   *  narrowing the range can never hand a live task's port to a new one. */
+  task_port_range_start?: number;
+  task_port_range_end?: number;
 }
 
 /** Install state of the bundled CLI on PATH (cli_install_status). */
