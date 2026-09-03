@@ -271,14 +271,15 @@ mod instance_dir_tests {
 
     #[test]
     fn a_clone_holding_a_second_account_gets_its_own_dir() {
-        // The reported case, verbatim from the maintainer's settings.
+        // The reported shape: a second agent entry whose CLAUDE_CONFIG_DIR
+        // points outside the first one's default.
         let agents = vec![
             agent("claude", None, &[]),
-            agent("next-claude", Some("claude"), &[("CLAUDE_CONFIG_DIR", "/Users/simion/.next-claude")]),
+            agent("next-claude", Some("claude"), &[("CLAUDE_CONFIG_DIR", "/Users/u/.next-claude")]),
         ];
         assert_eq!(
             instance_config_dir(&agents, "next-claude", Path::new(HOME)),
-            Some(PathBuf::from("/Users/simion/.next-claude")),
+            Some(PathBuf::from("/Users/u/.next-claude")),
         );
         // And the original is untouched, which is the whole point: installing
         // for one account must never write into the other's config.

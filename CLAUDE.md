@@ -105,8 +105,51 @@ No em dashes (—) anywhere in user-visible text: dialogs, tooltips, buttons, `C
 
 **GitHub prose uses semantic line breaks (SEMBR).** PR descriptions, PR review comments and issue comments: break the line after each sentence, and at major clause boundaries within a long one. Never hard-wrap to a column. GitHub reflows the source either way, so column wrapping buys nothing and costs the line-per-thought structure: editing a comment then means reflowing a paragraph instead of touching the one line that changed. See <https://sembr.org>. Commit message bodies and the `docs/` tree are the exception and stay wrapped to ~72-78 columns, matching what is already there.
 
+## Fixtures: never paste real output into the repo
+
+This repo is public and its history is permanent. A test fixture built by
+pasting real output from a machine carries whatever that machine knew: an
+employer's internal hostname, a work username, an absolute home path, an org
+name. `forge.rs`'s `glab auth status` fixture shipped a real self-hosted
+GitLab host and the maintainer's work account to GitHub, and the company found
+it in a brand-monitoring sweep. Nothing in review flagged it, because a real
+corporate hostname is syntactically indistinguishable from a made-up one.
+
+**Transcribe the shape, never the bytes.** When a bug reproduces from real CLI
+output, the fixture is synthetic from the first keystroke: retype the format
+with placeholders substituted as you go. Do not paste and then sanitize, which
+is how you miss the second occurrence three lines down.
+
+**"Verbatim" in a fixture comment is the confession.** If you are about to
+write "verbatim from my machine", "real output", "from the maintainer's
+settings", or "the reported case, exactly as sent", stop: you are describing a
+paste, and a paste is the leak. Say what shape the fixture reproduces and why
+that shape is the hard case, which is the part a future reader actually needs.
+
+**Use the placeholder vocabulary already in the tree.** Never invent a new
+realistic-looking domain, because someone owns it. Hosts: `acme.com`,
+`ghe.acme.com`, `git.acme.com`, `git.internal.acme.com`, `gitlab.example.io`,
+`github.corp.net`. People: `alice`, `bob`, `bob.smith.ext`. Paths: `/Users/u`,
+`/Users/alice`. Mail: `e2e@termic.dev`, `user@example.com`.
+
+**A third party's data is the severe case.** Your own name in a fixture is
+untidy; someone else's internal infrastructure is not yours to publish and you
+cannot unpublish it. That includes anything a user pastes into an issue or a
+bug report: their `auth status`, their remote URLs, their paths carry their
+employer too, so a fixture derived from a report gets placeholdered before it
+is committed, not after.
+
+**A leak that already shipped is a history problem, not a file problem.**
+Editing the file fixes today's clone and nothing else: the blob stays reachable
+by commit SHA, on forks, and in the GitHub API. Fix the working tree
+immediately so it stops spreading, then tell the maintainer plainly that the
+history still holds it and that scrubbing it means a force-push rewrite plus a
+GitHub support request to purge stale refs. That is the maintainer's call, not
+yours.
+
 ## What NOT to do without asking
 
+- Commit a fixture, doc example or screenshot built from real output without replacing every hostname, username and path with a placeholder (see ## Fixtures). A public repo's history is permanent.
 - Open a PR without first asking the user whether they manually tested the change (see ## Testing). Every suite in the repo being green is not a substitute, and neither is your own confidence in the diff.
 - Ad-hoc live-drive the app (the automation bridge) proactively for exploration. Default to NOT launching the live app for one-off poking. (This does NOT apply to the written e2e suite: running `make e2e` before committing a UI change is expected, per ## Testing.)
 - Switch editor from CodeMirror 6 (Monaco is slower in WKWebView, verified).

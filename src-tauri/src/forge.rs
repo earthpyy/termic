@@ -1083,7 +1083,7 @@ mod tests {
 
     #[test]
     fn a_failing_instance_beside_a_working_one_still_yields_a_usable_host() {
-        // Verbatim `glab auth status` for the common shape: a stale,
+        // A synthetic `glab auth status` in the common shape: a stale,
         // tokenless gitlab.com entry beside a signed-in self-hosted
         // instance. glab exits NON-ZERO for this, which is why `authed`
         // cannot be the exit code alone - the panel reported "Installed,
@@ -1094,14 +1094,14 @@ https://gitlab.com/api/v4/user: 401 {message: 401 Unauthorized}\n  \
 \u{2713} Git operations for gitlab.com configured to use ssh protocol.\n  \
 \u{2713} API calls for gitlab.com are made over https protocol.\n  \
 ! No token found (checked config file, keyring, and environment variables).\n\
-code.siemens-energy.com\n  \u{2713} Logged in to code.siemens-energy.com as \
-simion.agavriloaei.ext (keyring)\n  \u{2713} Git operations for \
-code.siemens-energy.com configured to use ssh protocol.\n";
+code.internal.acme.com\n  \u{2713} Logged in to code.internal.acme.com as \
+bob.smith.ext (keyring)\n  \u{2713} Git operations for \
+code.internal.acme.com configured to use ssh protocol.\n";
         let hosts = parse_auth_hosts(glab);
         // The signed-OUT instance must not be offered as usable, and the
         // signed-in one must be, so `!hosts.is_empty()` is a sound stand-in
         // for "this CLI can answer for at least one host".
-        assert_eq!(hosts, vec!["code.siemens-energy.com"]);
+        assert_eq!(hosts, vec!["code.internal.acme.com"]);
         assert!(!hosts.iter().any(|h| h == "gitlab.com"));
     }
 
