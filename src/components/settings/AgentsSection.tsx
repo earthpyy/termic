@@ -23,7 +23,7 @@ import { Trash2, Plus, Check, AlertTriangle, RotateCcw, Copy } from "lucide-reac
 import { CliIcon, CLI_BRAND_COLOR, resolveIconId } from "@/icons/cli";
 import { SignalInspector } from "./SignalInspector";
 import { cn, slugify } from "@/lib/utils";
-import { isTerminalEntry, BUILTIN_TITLE_SIGNALS } from "@/lib/agents";
+import { isTerminalEntry, BUILTIN_TITLE_SIGNALS, builtinBaseId, YOLO_ARGS_NOTES } from "@/lib/agents";
 import { SubSection } from "@/components/settings/SubSection";
 import { Toggle } from "@/components/settings/Controls";
 import { usePrefs } from "@/store/prefs";
@@ -659,6 +659,7 @@ function AgentsTabs({
           extendsName={active.extends ? (agents.find(a => a.id === active.extends)?.display_name ?? active.extends) : undefined}
           overrideCount={agentOverrides(agents, active.id).length}
           inherited={inherited}
+          yoloNote={YOLO_ARGS_NOTES[builtinBaseId(active.id, agents)]}
           resetOverrides={resetOverrides}
           autoFocus={autoFocusId === active.id}
           onAutoFocusConsumed={onAutoFocusConsumed}
@@ -670,7 +671,7 @@ function AgentsTabs({
   );
 }
 
-function AgentCard({ agent, detected, onPatch, onCommitId, onPatchCaps, onRemove, onClone, extendsName, overrideCount, resetOverrides, inherited, autoFocus, onAutoFocusConsumed, modified, onReset, dockerSandboxOn }: {
+function AgentCard({ agent, detected, onPatch, onCommitId, onPatchCaps, onRemove, onClone, extendsName, overrideCount, resetOverrides, inherited, autoFocus, onAutoFocusConsumed, modified, onReset, dockerSandboxOn, yoloNote }: {
   agent: Agent;
   /** Whether Docker sandboxing is enabled app-wide; gates the Docker-only
    *  environment field, which does nothing while it is off. */
@@ -690,6 +691,9 @@ function AgentCard({ agent, detected, onPatch, onCommitId, onPatchCaps, onRemove
   resetOverrides: (id: string) => void;
   /** The parent as it resolves TODAY: what every empty field here uses. */
   inherited?: Agent;
+  /** Agent-specific caveat appended to the YOLO args hint, when this agent's
+   *  built-in base has one (`YOLO_ARGS_NOTES`). */
+  yoloNote?: string;
   /** True for a freshly-created card — scrolls into view + focuses the name
    *  input on mount. */
   autoFocus?: boolean;
@@ -900,7 +904,7 @@ function AgentCard({ agent, detected, onPatch, onCommitId, onPatchCaps, onRemove
           />
         </Field>
         {!isTerminal && <>
-        <Field label="YOLO args" hint="Appended when YOLO mode (⚡) is on. Empty = no flag added.">
+        <Field label="YOLO args" hint={"Appended when YOLO mode (⚡) is on. Empty = no flag added." + (yoloNote ? " " + yoloNote : "")}>
           <ArgsInput value={agent.capabilities?.yolo_args || []}
             onChange={yolo_args => onPatchCaps({ yolo_args })}
             className="font-mono" placeholder={inheritedPlaceholder(inherited, a => a.capabilities?.yolo_args, "--dangerously-skip-permissions")}

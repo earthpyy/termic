@@ -44,6 +44,36 @@
 - **A self-upgrade mechanism that nothing calls is worse than none, because the docs describe it.** `agent_hooks_sync` shipped complete: versioned schema, staleness detection, in-place replacement, a Rust doc comment arguing why the user should not have to press a button, and a TypeScript type comment promising installs are "kept up to date automatically by `agentHooksSync`". Nothing invoked it, for two schema bumps. Every existing install stayed pinned at its original version while reporting `installed: true`, so the v3 fix for hooks being DEAD inside Docker reached only new installs. Nobody noticed because every layer described the intended behaviour and the missing piece was one call. When a mechanism has a version number, grep for its call site before trusting it, and pin the wiring in a test rather than the mechanism alone.
 - **Typing into an agent that has "painted and gone quiet" can KILL it, not just lose the prompt.** claude shows `Is this a project you created or one you trust?` for a repo it has never run in. Trust resolves through the REPO, not the directory, so a worktree of an already-trusted repo inherits it and never prompts (measured both ways, after the opposite was assumed): the exposure is the FIRST task in a newly added project, not every task. The picker paints and then goes quiet, which is byte-for-byte what a waiting input box looks like, so `waitForAgentReady` returned `settled`, `seedPromptWhenReady` typed the first message into the picker, and the submit 450ms later confirmed the HIGHLIGHTED option, which is `No, exit`. Measured: one injection at termic's own 3s floor, agent gone. No hook fires while the picker is up, not even `SessionStart`, so the absence of a readiness signal is itself the signal. Two defences, and both are needed because agents without hooks get no signal at all: `SessionStart` registered as `Signal::Ready`, and `deliverMessage({ verifyEcho: true })`, which withholds the submit unless the agent echoes what was typed (an input box echoes, a selection list does not). **A retry loop is not a fix here** and makes it worse: the first attempt lands before the dialog is interactive and is swallowed, the retry lands on a live picker and presses Enter. Never retry an injection without a positive signal that the agent is reading.
 
+- **An agent CLI's own policy layer can outrank the flag Termic passes, and it
+  kills the spawn rather than downgrading it (GH #274).** codex 0.15x merges a
+  MANAGED requirements layer on top of your config:
+  `/etc/codex/requirements.toml`,
+  `/etc/codex/managed_config.toml`, macOS MDM managed preferences
+  (`config/src/loader/macos.rs`), and `cloud_requirements` pushed by the ChatGPT
+  org a work account belongs to. If any of them forbids `danger-full-access`,
+  Termic's shipped codex `yolo_args`
+  (`--dangerously-bypass-approvals-and-sandbox`) makes codex exit at startup
+  with ``approval_policy = "never" cannot be used because requirements do not
+  allow sandbox_mode = "danger-full-access"``. It reads as "the Termic update
+  broke codex" because the error names Codex config and nothing points back at
+  the Settings field that passed the flag; the reporter's machine was the only
+  one affected precisely because it was their WORK machine. Nothing on the
+  Termic side changed: the flag has been the codex default since the initial
+  commit (`73fe81c`), and no migration in `load_settings` re-seeds `yolo_args`.
+  Do NOT change the shipped default to dodge this. The flag's own help text
+  says it is "intended solely for running in environments that are externally
+  sandboxed", which is exactly Termic's model (seatbelt or Docker is the real
+  boundary, see [sandbox.md](sandbox.md)). The intent-preserving per-agent
+  override is `-a never -s workspace-write`: still no approval prompts, codex's
+  own workspace sandbox instead of none. Clearing `yolo_args` altogether also
+  starts codex, but leaves the YOLO toggle reading as on while doing nothing.
+  `YOLO_ARGS_NOTES` (`src/lib/agents.ts`) is where that caveat is surfaced in
+  the Settings hint, keyed by `builtinBaseId` so clones get it too. Verified on
+  codex-cli 0.153.0: the flag works with no managed layer present, and a
+  repo-local `.codex/requirements.toml` is NOT one of those sources (only the
+  managed paths above count), so this cannot be reproduced without root or an
+  org account.
+
 ## React/Zustand traps
 
 - Don't return new objects/arrays from selectors without memo. Use frozen constants for defaults.

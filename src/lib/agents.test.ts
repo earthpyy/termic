@@ -21,7 +21,7 @@ vi.mock("@/lib/utils", () => ({
   slugify: (s: string) => s.toLowerCase().replace(/\s+/g, "-"),
 }));
 
-import { spawnArgsForCli, defaultCliFirst, visibleCliIds, cliSupportsIdSession, cliSupportsResumeById, agentDisplayName, decideResume, isTerminalCli, workDoneCapable, terminalLaunchCommand, classifyAgentTitle, compileSignals, BUILTIN_TITLE_SIGNALS, BUILTIN_OUTPUT_SIGNALS, builtinBaseId, resolveAgent, agentOverrides, hasPendingWork, notificationWantsAttention, PENDING_TAIL_ROWS } from "@/lib/agents";
+import { spawnArgsForCli, defaultCliFirst, visibleCliIds, cliSupportsIdSession, cliSupportsResumeById, agentDisplayName, decideResume, isTerminalCli, workDoneCapable, terminalLaunchCommand, classifyAgentTitle, compileSignals, BUILTIN_TITLE_SIGNALS, BUILTIN_OUTPUT_SIGNALS, builtinBaseId, YOLO_ARGS_NOTES, resolveAgent, agentOverrides, hasPendingWork, notificationWantsAttention, PENDING_TAIL_ROWS } from "@/lib/agents";
 import type { Agent, CliInfo } from "@/lib/types";
 
 // ── spawnArgsForCli ───────────────────────────────────────────────────
@@ -1233,5 +1233,42 @@ describe("notificationWantsAttention", () => {
     // This is the only knob for notification bodies (the ignore list is
     // built-in and not user-editable), so it has to be able to say "no".
     expect(notificationWantsAttention("claude", "Claude needs your permission")).toBe(false);
+  });
+});
+
+// GH #274. codex 0.15x merges a MANAGED requirements layer (/etc/codex/
+// requirements.toml, macOS MDM preferences, or the org attached to a work
+// ChatGPT account) and treats a forbidden `sandbox_mode` as a hard startup
+// error, not a downgrade: `--dangerously-bypass-approvals-and-sandbox` then
+// kills the spawn with a message that names Codex config, never the Termic
+// field that passed the flag. The note is what closes that gap, so what is
+// worth pinning is that it REACHES the field, including on a clone.
+describe("YOLO_ARGS_NOTES", () => {
+  const agents = [
+    { id: "codex", display_name: "codex", command: "codex", args: [] },
+    { id: "work-codex", display_name: "work codex", command: "codex", args: [], extends: "codex" },
+    { id: "claude", display_name: "claude", command: "claude", args: [] },
+  ] as unknown as NonNullable<Parameters<typeof classifyAgentTitle>[2]>;
+
+  it("reaches codex and every clone of it", () => {
+    expect(YOLO_ARGS_NOTES[builtinBaseId("codex", agents)]).toBeTruthy();
+    expect(YOLO_ARGS_NOTES[builtinBaseId("work-codex", agents)])
+      .toBe(YOLO_ARGS_NOTES.codex);
+  });
+
+  it("leaves agents with no caveat without one", () => {
+    expect(YOLO_ARGS_NOTES[builtinBaseId("claude", agents)]).toBeUndefined();
+    expect(YOLO_ARGS_NOTES[builtinBaseId("never-heard-of-it", agents)]).toBeUndefined();
+  });
+
+  it("names the error the user actually sees, and the flags that replace it", () => {
+    // The note is only findable by someone pasting Codex's own wording into
+    // a search, so the substring it quotes has to stay verbatim.
+    expect(YOLO_ARGS_NOTES.codex).toContain("requirements do not allow sandbox_mode");
+    expect(YOLO_ARGS_NOTES.codex).toContain("-a never -s workspace-write");
+  });
+
+  it("is free of em dashes, like all user-visible copy", () => {
+    for (const note of Object.values(YOLO_ARGS_NOTES)) expect(note).not.toContain("—");
   });
 });

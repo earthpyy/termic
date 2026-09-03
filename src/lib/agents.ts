@@ -432,6 +432,23 @@ export const STICKY_DONE_MS = 8_000;
  *  a chain that points at itself must terminate, not hang. */
 const EXTENDS_MAX_DEPTH = 8;
 
+/** Per-agent footnote appended to the "YOLO args" hint (GH #274).
+ *
+ *  The shipped default is not always ACCEPTED: an agent CLI can carry its own
+ *  policy layer that outranks the flag Termic passes, and the failure lands as
+ *  a startup error in the terminal with nothing pointing back at the field
+ *  that caused it. Keyed by the BUILT-IN BASE id (`builtinBaseId` walks
+ *  `extends`) so a clone of codex gets the same note.
+ *
+ *  No em dashes: this is user-visible copy (see CLAUDE.md ## Copy rules). */
+export const YOLO_ARGS_NOTES: Record<string, string> = {
+  codex: "Codex refuses to START, rather than downgrade, when a managed policy "
+    + "(an org-managed requirements.toml, MDM, or a work ChatGPT account) disallows "
+    + "danger-full-access. If you see \"requirements do not allow sandbox_mode\", "
+    + "use -a never -s workspace-write here instead: still no approval prompts, "
+    + "Codex's own sandbox instead of none.",
+};
+
 export function builtinBaseId(cli: string, agents: Agent[]): string {
   let id = cli;
   for (let i = 0; i < EXTENDS_MAX_DEPTH; i++) {
