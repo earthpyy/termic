@@ -2870,6 +2870,48 @@ describe("agent hooks", () => {
 }
 `;
 
+  // The Agent hooks block renders NOTHING unless a supported agent CLI is
+  // actually on PATH (`present.filter(supported)` in AgentHooksBlock), and CI
+  // installs none: no claude, no grok, no agy, no opencode. The fixture's
+  // `fakeagent` cannot stand in, because it is deliberately not one of the four
+  // and the row test below asserts it is absent.
+  //
+  // So the spec was asserting on whatever the runner happened to have, and
+  // failed with `text never appeared: Agent hooks` whenever it had nothing.
+  // Same message every time, but not every run, which reads as flake and is
+  // really an environment dependency.
+  //
+  // Seed the detection this block reads instead. Detection itself is covered by
+  // its own specs; what is under test here is what the block DOES with a
+  // detected, supported agent, and that must not depend on the machine.
+  let savedClis: unknown;
+  before(async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    savedClis = await browser.execute(() => {
+      const store = window.__termic!.useApp;
+      const prev = store.getState().detectedClis;
+      // REPLACE rather than merge, so the test sees exactly one supported
+      // agent whether it runs on a bare CI runner or on a laptop with four of
+      // them installed. Merging would leave the assertions below depending on
+      // which agents the machine happens to have, which is the bug being
+      // fixed, just moved one level down.
+      store.setState({
+        detectedClis: {
+          claude: { name: "claude", found: true, path: "/usr/bin/claude", version: "e2e" },
+        },
+      });
+      return prev;
+    });
+  });
+  // Put it back: the store is shared with every spec after this one, and a
+  // claude that does not exist would make them assert against a phantom agent.
+  after(async () => {
+    await browser.execute((prev) => {
+      window.__termic!.useApp.setState({ detectedClis: prev as never });
+    }, savedClis);
+  });
+
   it("merges into the user's config and restores it byte-for-byte", async () => {
     await waitForAppShell();
     await requireTermicApi();
