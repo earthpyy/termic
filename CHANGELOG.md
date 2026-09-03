@@ -4,7 +4,7 @@ All notable changes to Termic, newest first. This file is the human-authored
 source of truth: the in-app Update card and the /changelog page on termic.dev
 are generated from it. See the `release` skill for how entries are added.
 
-## [1.1.1] - 2026-09-03
+## [1.1.2] - 2026-09-03
 
 Agents now tell Termic what they are doing, instead of Termic guessing from the terminal.
 
@@ -19,6 +19,7 @@ Agents now tell Termic what they are doing, instead of Termic guessing from the 
 
 ### Bug fixes
 
+- **An agent tab no longer loads forever after publishing an artifact.** Publishing leaves a background subscription running for the whole session, which Claude reports as unfinished work, so every completed turn after it kept the tab spinning. Termic now holds the spinner only for work the agent is actually waiting on, and a tab can never stay in progress indefinitely.
 - **A finished turn no longer rings the needs-you bell.** Claude sends a notification when work completes, not only when it wants you, and Termic treated every notification as needs-you. Only a genuine request for you rings now.
 - **Termic no longer hands a spawned agent another agent's session.** Launching Termic from inside an agent session copied that session's identity into every agent it spawned: the new agent believed it was a child and turned transcript saving off, adopted the launcher's session, and was handed a live messaging socket and token for it, inside the sandbox.
 - **A badge clears when you come back to it.** A done or needs-you badge on the tab already in front of you now clears when you focus the window, instead of only when you clicked away and back.

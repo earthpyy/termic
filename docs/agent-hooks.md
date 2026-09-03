@@ -33,7 +33,7 @@ target.
 
 | agent | ready | working | attention | done | interrupt |
 | --- | --- | --- | --- | --- | --- |
-| claude | `SessionStart` | `UserPromptSubmit`, `PreToolUse` | `PermissionRequest` | `Stop`, guarded on `background_tasks: []` | none exists |
+| claude | `SessionStart` | `UserPromptSubmit`, `PreToolUse` | `PermissionRequest` | `Stop`, guarded on the `background_tasks` whitelist | none exists |
 | grok | not measured | `UserPromptSubmit`, `PreToolUse` | `Notification` | `Stop` + `StopCancelled` | `StopCancelled` |
 | agy | not measured | `PreInvocation` | none exists (see below) | `Stop`, guarded on `fullyIdle` | none exists |
 | opencode | not measured | `chat.message`, `permission.replied` | `permission.asked` | `session.idle` | `session.idle`, on the SECOND escape |
@@ -156,9 +156,18 @@ insufficient; the cage already permits unix sockets generally.
 
 While an agent's hooks are installed AND at least one has been seen on that
 pty, nothing else may end a turn for it: not the title, not byte-quiet, not
-scrollback stability, not the settled hash, not either ceiling. They are one
+scrollback stability, not the settled hash, not the 90s ceiling. They are one
 heuristic wearing five hats, and leaving any armed reproduces the bug hooks
 exist to fix.
+
+**The 10-minute absolute ceiling is the one exception, and it must stay one.**
+It is not a sixth guess at whether a turn ended; it is a liveness backstop, and
+it ran BELOW the hooks-own gate until an artifact watch proved what that costs
+(see below). Everything termic knows about a hook-owned turn arrives over a
+contract termic does not control, so the state machine needs one bound that
+does not depend on that contract holding. Ten minutes of a genuinely working
+agent costs a spinner that clears early and is re-armed by the very next
+`PreToolUse` heartbeat. A missing done costs the tab, permanently.
 
 **Installed is not working**, and conflating them hangs the UI. Hooks earn the
 right per pty by delivering once (`hookSeenRef`). A working hook proves itself
@@ -175,8 +184,50 @@ for 44 seconds with the agent idle at its prompt.
 **A hook done outranks that token.** The token stops one turn NOTIFYING twice
 (a settle, a late OSC 9); it was never meant to stop a turn ENDING. Safe by
 measurement: claude fires `Stop` several times per turn and the script drops
-every one whose `background_tasks` is non-empty, so at most one qualifying done
-reaches us.
+every one whose `background_tasks` holds delegated work, so at most one
+qualifying done reaches us.
+
+## The done guard is a whitelist, because "in flight" includes things that never end
+
+claude's `Stop` payload carries `background_tasks`, and the guard used to hold
+the turn open whenever that array was non-empty. That question is the wrong one,
+and a session that publishes an artifact answers it wrong forever.
+
+Read out of 2.1.259: the payload is built by mapping the WHOLE task registry
+through a single filter, `status is running|pending && isBackgrounded !== false`.
+Nothing else is dropped, and the switch that decorates each entry has an
+explicit arm for `monitor_ws`, a websocket monitor. An artifact's live-updates
+subscription is one of those, it opens on the first publish, and it stays
+`running` for the rest of the session. claude's own task list hides exactly
+these (`if (t.type === "monitor_ws" && t.ambient) continue`); the hook payload
+does not.
+
+So from one `Artifact` publish onward, every `Stop` looked like outstanding
+work, the hook emitted nothing, and because hooks had already proved themselves
+on that pty there was no demoter and no ceiling left to notice. Reported as a
+tab stuck on loading across new turns and finished turns, which is exactly what
+it was.
+
+The guard now asks whether the AGENT is still working, which only delegated
+work answers. Held: `subagent`, `workflow`, `shell`, `teammate`, `cloud
+session`, `MCP task`. Not held: `monitor` (either dialect), `dream`, `auto-mode
+scan`, and any type a future release adds. The friendly labels are claude's own
+(`local_agent` → `subagent`, `local_bash` → `shell`, and so on); an unrecognised
+type falls through to its raw discriminant and therefore to done.
+
+**Fail towards done here, the opposite way to the fallback path.** Once hooks
+own a tab, a wrong hold is permanent and a wrong done is corrected by the next
+`PreToolUse` heartbeat, because working is the only sustained state and it is
+re-asserted many times per turn. That asymmetry is why an unknown type emits.
+
+The array is sliced out of the payload before matching, not matched across the
+whole thing: `last_assistant_message` carries the agent's own prose, and a turn
+that discussed `"type":"shell"` would otherwise hold its own spinner down. `##`
+(longest prefix) picks the last occurrence, which is the real field, since
+claude serialises the message first. `agent_hooks.rs`'s tests run the generated
+script under `/bin/sh` against real payload shapes rather than asserting on its
+source, because every bug this guard has had was one a substring assertion
+agreed with.
 
 ## Interrupts: the one thing hooks do not cover
 
@@ -301,6 +352,9 @@ to check and the easiest to get wrong.
 - **`SubagentStop` is not a done.** 107 fires against 2 real Stops in one run.
   `background_tasks` already covers subagents (`type: "subagent"` ×1006,
   `"shell"` ×1529).
+- **"Is anything in flight" is not "is the agent working".** The registry holds
+  ambient monitors that outlive every turn. Whitelist the types that mean the
+  agent will be woken again; see the guard section above.
 - **claude's notifications are not all needs-you.** Eleven `notificationType`s,
   five of which mean it. `agent_completed` sends `` `${label} finished` `` when
   a turn SUCCEEDS, and termic spoofs iTerm2 so it arrives as OSC 9. See

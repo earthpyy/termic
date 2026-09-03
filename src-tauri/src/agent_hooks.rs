@@ -49,7 +49,13 @@ use std::path::{Path, PathBuf};
 // submit landed on the highlighted default, `No, exit`. A v3 install types into
 // the dialog exactly as before, so this is stale-and-harmful, not stale-and-
 // quieter. See `Signal::Ready`.
-pub const SCHEMA_VERSION: u32 = 4;
+// v5 turns claude's Done guard from "is anything in flight" into a whitelist of
+// task types. v4 asked the wrong question: an artifact watch is an ambient
+// websocket monitor that stays `running` for the whole session, so one publish
+// made every later `Stop` look like outstanding work and the tab span forever
+// with no demoter left to correct it. A v4 install is not stale-and-quieter, it
+// is a tab that never stops loading, which is the same severity as v3 in Docker.
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Directory we create inside the agent's config dir. Also the prefix that
 /// identifies our entries for removal, which is why it must never be renamed
@@ -349,16 +355,58 @@ pub fn script_body(agent: &str, sig: Signal) -> String {
     // is the kind of text heuristic hooks exist to replace: this reads the
     // protocol instead.
     //
+    // The guard is a WHITELIST of task types, and it has to be, because
+    // "non-empty" was measured to mean things that never end. Read out of
+    // 2.1.259: the Stop payload is built by mapping the whole task registry
+    // through one filter, `status is running|pending && isBackgrounded !==
+    // false`. Nothing else is dropped, and the switch that decorates the
+    // entries has an explicit arm for `monitor_ws` - a websocket monitor.
+    // Publishing an artifact opens one (the live-updates subscription) and it
+    // stays `running` for the whole session, so from the first publish onward
+    // EVERY `Stop` carried a non-empty array and this guard dropped every one
+    // of them. claude's own task list hides exactly these
+    // (`if (t.type === "monitor_ws" && t.ambient) continue`); the hook payload
+    // does not, so termic has to.
+    //
+    // So the question is not "is anything in flight" but "is the AGENT still
+    // working", and only delegated units of work answer yes. The friendly
+    // labels come from claude's own type map: local_agent -> subagent,
+    // local_workflow -> workflow, local_bash -> shell, in_process_teammate ->
+    // teammate, remote_agent -> cloud session, mcp_task -> MCP task. Ambient
+    // monitors (monitor_ws / monitor_mcp), `dream` and `auto-mode scan` are
+    // deliberately absent, and so is any type a future release adds: an
+    // unknown type falls through to done.
+    //
+    // Fail towards done, not towards working. Once hooks own a tab there is no
+    // demoter left to correct a done that never arrives, so a wrong hold is
+    // permanent; a wrong done is re-armed by the very next `PreToolUse`
+    // heartbeat. The asymmetry runs the opposite way to the fallback path's.
+    //
     // Deliberately no `jq`: whitespace is stripped and the field matched
     // literally, so the script keeps its "no dependencies" property. An absent
     // field means an older agent that cannot background work, so done stands.
+    // The array is sliced out before matching rather than matched across the
+    // whole payload, because `last_assistant_message` carries the agent's own
+    // prose and a turn that happened to discuss `"type":"shell"` would
+    // otherwise hold its own spinner down forever. `##` (longest prefix) picks
+    // the LAST occurrence, which is the real field: claude serialises
+    // `last_assistant_message` before `background_tasks`.
     let guard = match (agent, sig) {
         ("claude", Signal::Done) => concat!(
             "flat=$(cat | tr -d '[:space:]')\n",
-            "# Non-empty background_tasks: the turn ended, the WORK did not.\n",
+            "# Only DELEGATED work means the agent itself is still going. An\n",
+            "# ambient monitor (an artifact watch) never ends, so it must not\n",
+            "# hold the turn open. Unknown types fall through to done.\n",
             "case \"$flat\" in\n",
-            "  *'\"background_tasks\":[]'*) ;;\n",
-            "  *'\"background_tasks\":['*) exit 0 ;;\n",
+            "  *'\"background_tasks\":['*)\n",
+            "    tasks=${flat##*'\"background_tasks\":['}\n",
+            "    tasks=${tasks%%]*}\n",
+            "    case \"$tasks\" in\n",
+            "      *'\"type\":\"subagent\"'*|*'\"type\":\"workflow\"'*|\\\n",
+            "      *'\"type\":\"shell\"'*|*'\"type\":\"teammate\"'*|\\\n",
+            "      *'\"type\":\"cloudsession\"'*|*'\"type\":\"MCPtask\"'*) exit 0 ;;\n",
+            "    esac\n",
+            "    ;;\n",
             "esac\n",
         ),
         ("agy", Signal::Done) => concat!(
@@ -1667,11 +1715,12 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
     }
 
     #[test]
-    fn adding_ready_bumped_the_schema_so_sync_replaces_old_installs() {
+    fn the_schema_bump_is_what_makes_sync_replace_old_installs() {
         // The upgrade path rests entirely on this. An install from the build
-        // before Ready must read as stale, or `agent_hooks_sync` skips it and
-        // the user keeps a set that types into startup dialogs forever.
-        assert_eq!(SCHEMA_VERSION, 4, "bump me with the hook set, or installs go stale silently");
+        // before the current set must read as stale, or `agent_hooks_sync`
+        // skips it and the user keeps that set forever: v3 types into startup
+        // dialogs, v4 holds a tab on `working` for the rest of the session.
+        assert_eq!(SCHEMA_VERSION, 5, "bump me with the hook set, or installs go stale silently");
     }
 
     #[test]
@@ -1744,11 +1793,22 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
     fn done_hooks_refuse_to_fire_while_work_is_outstanding() {
         let claude = script_body("claude", Signal::Done);
         assert!(claude.contains("background_tasks"), "claude's done must consult its payload");
-        // The empty case must be matched BEFORE the general one, or an empty
-        // array reads as "still working" and done never fires at all.
-        let empty_at = claude.find(r#"*'"background_tasks":[]'*"#).expect("empty arm");
-        let any_at = claude.find(r#"*'"background_tasks":['*"#).expect("non-empty arm");
-        assert!(empty_at < any_at, "the empty-array arm must come first");
+        // A WHITELIST, not a non-empty test. The delegated types hold the turn
+        // open; anything else, named or not, lets done through. See the guard.
+        for held in ["subagent", "workflow", "shell", "teammate"] {
+            assert!(claude.contains(&format!(r#""type":"{held}""#)),
+                "{held} must hold the turn open");
+        }
+        // The types that never end must NOT appear. `monitor` is the artifact
+        // watch (an ambient websocket monitor); it outlives every turn.
+        for never in ["monitor", "dream", "auto-modescan"] {
+            assert!(!claude.contains(&format!(r#""type":"{never}""#)),
+                "{never} must never hold the turn open");
+        }
+        // Sliced out of the array, not matched across the whole payload:
+        // `last_assistant_message` is the agent's own prose.
+        assert!(claude.contains(r#"tasks=${flat##*'"background_tasks":['}"#),
+            "the array must be sliced before matching");
 
         let agy = script_body("agy", Signal::Done);
         assert!(agy.contains("fullyIdle"), "agy's done must consult its payload");
@@ -1760,6 +1820,117 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
         // Only Done inspects a payload. Working and attention are unconditional.
         assert!(!script_body("claude", Signal::Working).contains("background_tasks"));
         assert!(!script_body("claude", Signal::Attention).contains("background_tasks"));
+    }
+
+    /// Run claude's generated Done script against a real `Stop` payload and
+    /// report whether it emitted. `TERMIC_PTY` points at a temp file, which is
+    /// exactly how the script addresses a pty: a plain path it redirects into.
+    ///
+    /// This executes the shell rather than asserting on the source, because
+    /// every bug this guard has had was a semantic one that a substring
+    /// assertion happily agreed with.
+    #[cfg(unix)]
+    fn done_emits_for(payload: &str) -> bool {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+
+        let dir = std::env::temp_dir().join(format!(
+            "termic-hook-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("done.sh");
+        let pty = dir.join("pty");
+        std::fs::write(&script, script_body("claude", Signal::Done)).unwrap();
+        std::fs::write(&pty, "").unwrap();
+
+        let mut child = Command::new("/bin/sh")
+            .arg(&script)
+            .env("TERMIC_TASK_ID", "t1")
+            .env("TERMIC_PTY", &pty)
+            .env_remove("GROK_HOOK_EVENT")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+        {
+            use std::io::Write as _;
+            child.stdin.as_mut().unwrap().write_all(payload.as_bytes()).unwrap();
+        }
+        assert!(child.wait().unwrap().success(), "a hook must never exit non-zero");
+
+        let mut out = String::new();
+        std::fs::File::open(&pty).unwrap().read_to_string(&mut out).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        out.contains("133;D")
+    }
+
+    /// One payload per background-task type claude can report, in the shape
+    /// `Rcr` builds them (2.1.259). Types transcribed from claude's own label
+    /// map; the values are synthetic.
+    #[cfg(unix)]
+    fn stop_payload(tasks: &str) -> String {
+        format!(
+            r#"{{"session_id":"s1","transcript_path":"/Users/u/.claude/x.jsonl",
+               "cwd":"/Users/u/proj","hook_event_name":"Stop","stop_hook_active":false,
+               "last_assistant_message":"done","background_tasks":[{tasks}],
+               "session_crons":[]}}"#
+        )
+    }
+
+    // The regression this whole guard exists to not have twice.
+    //
+    // v4 asked "is background_tasks non-empty". An artifact watch answers yes
+    // for the entire session: it is an ambient websocket monitor, it is
+    // `running` from the moment a page is published, and claude's Stop payload
+    // includes it (the builder's only filter is status running|pending). So one
+    // publish silenced every later done, and because hooks had already proven
+    // themselves on that pty, no demoter and neither ceiling was left armed to
+    // notice. The tab loaded forever, across new turns and finished turns.
+    #[test]
+    #[cfg(unix)]
+    fn done_fires_through_an_artifact_watch() {
+        let watch = r#"{"id":"m1","type":"monitor","status":"running",
+                        "description":"Artifact live updates"}"#;
+        assert!(done_emits_for(&stop_payload(watch)),
+            "an artifact watch must NOT hold the spinner: it never ends");
+        assert!(done_emits_for(&stop_payload("")), "an empty array is plainly done");
+    }
+
+    // The half the guard is right about, kept honest.
+    #[test]
+    #[cfg(unix)]
+    fn done_waits_for_delegated_work() {
+        let cases = [
+            (r#"{"id":"a1","type":"subagent","status":"running","description":"Explore","agent_type":"Explore"}"#, false),
+            (r#"{"id":"w1","type":"workflow","status":"running","description":"review","name":"review"}"#, false),
+            (r#"{"id":"b1","type":"shell","status":"running","description":"build","command":"make beta"}"#, false),
+            (r#"{"id":"d1","type":"dream","status":"running","description":"dreaming"}"#, true),
+            (r#"{"id":"u1","type":"some_future_type","status":"running","description":"?"}"#, true),
+        ];
+        for (task, should_emit) in cases {
+            assert_eq!(done_emits_for(&stop_payload(task)), should_emit,
+                "wrong verdict for {task}");
+        }
+        // A watch alongside a real subagent still waits for the subagent.
+        let both = r#"{"id":"m1","type":"monitor","status":"running","description":"Artifact live updates"},
+                      {"id":"a1","type":"subagent","status":"running","description":"Explore","agent_type":"Explore"}"#;
+        assert!(!done_emits_for(&stop_payload(both)), "the subagent must still hold");
+    }
+
+    // The agent's own prose must not be able to hold its spinner down. A turn
+    // that discusses `"type":"shell"` (this one did) serialises that text into
+    // `last_assistant_message`, which is why the array is sliced out first.
+    #[test]
+    #[cfg(unix)]
+    fn done_ignores_task_types_quoted_in_the_transcript() {
+        let payload = r#"{"session_id":"s1","hook_event_name":"Stop","stop_hook_active":false,
+            "last_assistant_message":"The whitelist holds for \"type\":\"subagent\" and \"type\":\"shell\".",
+            "background_tasks":[],"session_crons":[]}"#;
+        assert!(done_emits_for(payload),
+            "only the background_tasks array may decide this");
     }
 
     // ── Antigravity ─────────────────────────────────────────────────
@@ -1958,3 +2129,4 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
         assert!(strays.is_empty(), "temp file left behind");
     }
 }
+

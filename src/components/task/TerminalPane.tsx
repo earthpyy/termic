@@ -2717,6 +2717,37 @@ const captureArmedRef = useRef(false);
         interruptWork(`interrupt then quiet (quietMs=${Date.now() - lastDataAtRef.current})`);
         return;
       }
+      // The absolute ceiling runs for HOOK-OWNING agents too, and is the only
+      // thing below this line that does. Everything else here is a heuristic
+      // guessing at whether a turn ended, which is what hooks replace; this is
+      // a liveness backstop, and standing it down on the strength of hooks left
+      // the state machine with no bound at all.
+      //
+      // Measured, and the reason this moved: publishing an artifact opens an
+      // ambient websocket monitor that stays `running` for the whole session,
+      // claude reports it in every later `Stop` payload, and the done hook's
+      // "anything in flight" guard dropped every one of them. The guard is a
+      // whitelist now (src-tauri/src/agent_hooks.rs), so that specific hole is
+      // closed, but a hook contract termic does not control cannot be the only
+      // thing standing between a tab and a spinner that never stops. The next
+      // agent release that adds a task type, or a hook whose transport dies
+      // mid-session, would strand a tab exactly the same way.
+      //
+      // `force` is passed for the same reason the non-hook path passes it: this
+      // is the one demoter that outranks a screen-scanned pending-work hold.
+      // Ten minutes of a genuinely working agent costs a spinner that clears
+      // early and is re-armed by the next `PreToolUse` heartbeat, which is a
+      // frame of wrong against a session of stuck.
+      if (cur && cur.type === "terminal" && cur.workState === "working"
+          && workingStartedAtRef.current > 0
+          && Date.now() - workingStartedAtRef.current >= absoluteCeilingMs) {
+        logWorkState("ceiling-backstop",
+          `cli=${tab.cli} hooksOwn=${hooksOwn} ageMs=${Date.now() - workingStartedAtRef.current}`
+          + " forcing done; a hook done never arrived");
+        fireDone(`absolute ceiling (${absoluteCeilingMs}ms, hooksOwn=${hooksOwn})`,
+          fallbackReason, false, true);
+        return;
+      }
       if (hooksOwn) return;
       // Byte-quiet fallback: if no PTY data has arrived for QUIET_MS
       // and the tab is `working`, demote to `done`. Fires when the
@@ -2779,27 +2810,12 @@ const captureArmedRef = useRef(false);
         // ceiling, which is the one that outranks the hold.
         if (fireDone(`90s hard ceiling`, fallbackReason)) return;
       }
-      // ABSOLUTE ceiling — fires even when senderBusy. The 90s ceiling and
-      // byte-quiet fallback both defer to the sender's "busy" title, which
-      // is correct for genuine long work but leaves one failure mode: a
-      // sender signal that gets STUCK on "working" (a crashed TUI, a title
-      // that never clears) would otherwise spin forever. This backstop
-      // force-clears any "working" state older than the cap regardless of
-      // sender signals, so the experimental work-in-progress spinner can
-      // never get permanently stuck. Set high enough (10 min) that a real
-      // long-running task is extremely unlikely to trip it.
-      //
-      // `localStorage.workDoneCeilingMs` shortens it (resolved at sampler
-      // start, above). Ten minutes is not something a test can wait out, and
-      // this is the ONLY path that clears a done the agent's own status line is
-      // holding down, so without a knob the backstop is untestable and stays
-      // broken silently (it did).
-      if (cur && cur.type === "terminal" && cur.workState === "working"
-          && workingStartedAtRef.current > 0
-          && Date.now() - workingStartedAtRef.current >= absoluteCeilingMs) {
-        fireDone(`absolute ceiling (${absoluteCeilingMs}ms)`, fallbackReason, false, true);
-        return;
-      }
+      // The ABSOLUTE ceiling used to sit here. It now runs ABOVE the hooksOwn
+      // gate, because down here it was unreachable for exactly the agents that
+      // had no other way out. Its rationale is unchanged and lives at the new
+      // site: it fires even when senderBusy, it is the only path that outranks
+      // a screen-scanned pending-work hold, and `localStorage.workDoneCeilingMs`
+      // shortens it so a test can reach it at all.
       // Content-hash check (kept as a third path). Also gated on
       // !senderBusy — Codex's TUI can pause rendering mid-task for
       // several seconds without the hash changing, but if the title

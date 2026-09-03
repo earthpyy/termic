@@ -703,6 +703,61 @@ describe("a hold that never clears still ends", () => {
   });
 });
 
+// P0: the same backstop, for a tab whose agent reports its own state. This is
+// the case that was actually UNBOUNDED, and it needs its own task because the
+// ceiling override is resolved once when the sampler starts: setting it on a
+// tab that is already mounted changes nothing.
+//
+// The reported case was a claude session that published an artifact. That opens
+// an ambient websocket monitor which stays `running` for the rest of the
+// session, claude reports it in every later `Stop` payload, and the done hook's
+// old "is background_tasks non-empty" guard dropped every one of them. The
+// guard is a whitelist now, so that particular hole is shut. The reason it was
+// unbounded is here, not in the hook: the absolute ceiling sat BELOW the
+// hooks-own gate and never ran, so a hook done that never arrives had nothing
+// behind it at all, across new turns and finished turns.
+//
+// `#hookturn` is that shape exactly: 133;C, then a title going idle, and no
+// 133;D ever. The suppression spec above asserts such a tab is still working at
+// 8s, which is right. This asserts it does not stay that way forever.
+describe("a hook-owned turn whose done never arrives still ends", () => {
+  let taskId!: string;
+  const CEILING_MS = 8_000;
+
+  after(async () => {
+    await browser.execute(() => localStorage.removeItem("workDoneCeilingMs"));
+    await setHooksOwnState("fakeagent", false);
+    if (taskId) await archiveTask(taskId);
+  });
+
+  it("force-clears the working state at the absolute ceiling", async function () {
+    this.timeout(90_000);
+    await waitForAppShell();
+    await requireTermicApi();
+    await requireWorkBadges();
+    await setHooksOwnState("fakeagent", true);
+    await browser.execute((ms) => localStorage.setItem("workDoneCeilingMs", String(ms)), CEILING_MS);
+    taskId = await openTask("e2e-hook-ceiling");
+    await waitForAgentReady(taskId);
+
+    await submitToAgent(taskId, "#hookturn");
+    await waitForWorkBadge(taskId, "working", {
+      timeout: 20_000,
+      message: "the hook-owned turn never reached the working badge",
+    });
+
+    // The hook said 133;C and will never say 133;D, the title has gone idle and
+    // is ignored, and every heuristic demoter is stood down for this tab. The
+    // ceiling is the only thing left.
+    await waitForWorkBadgeGone(taskId, "working", {
+      timeout: CEILING_MS + 30_000,
+      interval: 500,
+      message: "a hook done never came and the ceiling never fired - tab pinned to working",
+    });
+    await snap("agent-hook-ceiling.png");
+  });
+});
+
 // P0: a done we got wrong must not outlive the evidence. Every heuristic here
 // can misread a stage boundary in a long multi-stage turn as the end of it, and
 // the recovery used to be a click: agent signals could never undo a "done", so
