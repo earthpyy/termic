@@ -2888,21 +2888,7 @@ describe("agent hooks", () => {
   before(async () => {
     await waitForAppShell();
     await requireTermicApi();
-    savedClis = await browser.execute(() => {
-      const store = window.__termic!.useApp;
-      const prev = store.getState().detectedClis;
-      // REPLACE rather than merge, so the test sees exactly one supported
-      // agent whether it runs on a bare CI runner or on a laptop with four of
-      // them installed. Merging would leave the assertions below depending on
-      // which agents the machine happens to have, which is the bug being
-      // fixed, just moved one level down.
-      store.setState({
-        detectedClis: {
-          claude: { name: "claude", found: true, path: "/usr/bin/claude", version: "e2e" },
-        },
-      });
-      return prev;
-    });
+    savedClis = await browser.execute(() => window.__termic!.useApp.getState().detectedClis);
   });
   // Put it back: the store is shared with every spec after this one, and a
   // claude that does not exist would make them assert against a phantom agent.
@@ -2970,7 +2956,33 @@ describe("agent hooks", () => {
     // downstream of what this decides.
     await browser.execute(() =>
       window.__termic!.useApp.getState().openSettings("agents"));
-    await waitForText("Agent hooks");
+    // Reproduce the CI condition first, so this spec verifies its own
+    // mechanism on any machine. With no supported agent detected the block
+    // renders nothing (`present.filter(supported)` is empty), which is exactly
+    // the state that made this fail on a runner with no agent CLI installed
+    // while passing on every developer laptop that has claude.
+    await browser.execute(() => window.__termic!.useApp.setState({ detectedClis: {} }));
+    await waitForTextGone("Agent hooks");
+    // Seeded on every poll, not once. `refreshClis()` is fired at startup and
+    // resolves asynchronously - it spawns a login shell to resolve PATH, which
+    // is slow on a cold runner - and lands with `set({ detectedClis })`, so a
+    // single seed before this point is simply overwritten by a detection that
+    // finds nothing. Re-applying until the block renders survives whichever
+    // async writer wins, and costs nothing once it has.
+    await browser.waitUntil(
+      () => browser.execute(() => {
+        const store = window.__termic!.useApp;
+        if (!store.getState().detectedClis.claude?.found) {
+          store.setState({
+            detectedClis: {
+              claude: { name: "claude", found: true, path: "/usr/bin/claude", version: "e2e" },
+            },
+          });
+        }
+        return document.body.innerText.includes("Agent hooks");
+      }),
+      { timeout: 20_000, timeoutMsg: "Agent hooks block never rendered with a seeded agent" },
+    );
     // Collapsed by default: expanded, this pushed the per-agent tabs (the
     // reason anyone opens the page) below the fold behind two paragraphs of
     // protocol detail.
