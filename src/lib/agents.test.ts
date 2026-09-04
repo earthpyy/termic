@@ -323,6 +323,63 @@ describe("pi resume", () => {
   });
 });
 
+// GH #276 follow-up, reported from a real session: with codex hooks installed,
+// EVERY codex turn ended with a needs-you bell.
+//
+// codex puts its whole final assistant message on `OSC 9`. termic reads an
+// `OSC 9` as "the agent is asking for you", so every completion became a
+// request. The bodies below are transcribed from a captured
+// `termic-workstate.log` with the paths placeholdered; their shape is the
+// point, which is that they are ordinary prose with nothing to answer.
+describe("codex notifications are announcements, not requests", () => {
+  beforeEach(() => { mockAgents.length = 0; });
+
+  const bodies = [
+    "Done. Quick SEO pass landed: - Added `/sitemap.xml -> /sitemap-index.xml` redirect in [public/_redirects](/Users/u/proj/public/_redirects)",
+    "Tried `sudo -n true`. It failed with: ```text zsh:1: operation not permitted: sudo ``` So this session cannot run permission-escalating commands.",
+    "Read `/etc/hosts` successfully from outside the repo. Exit code: `0`",
+    "I am here. What do you want me to do next?",
+  ];
+
+  it("never raises attention, whatever the body says", () => {
+    for (const b of bodies) {
+      expect(notificationWantsAttention("codex", b)).toBe(false);
+    }
+    // Including a body that happens to contain claude's allow-list wording:
+    // the claim is about the AGENT, not about phrasing.
+    expect(notificationWantsAttention("codex", "codex needs your permission")).toBe(false);
+  });
+
+  it("leaves every other agent alone", () => {
+    // claude keeps its allow-list: a real permission prompt still badges, and
+    // its 60s idle nag still does not.
+    expect(notificationWantsAttention("claude", "Claude needs your permission")).toBe(true);
+    expect(notificationWantsAttention("claude", "Claude is waiting for your input")).toBe(false);
+    // An agent nobody has measured still defaults to trusting what it says.
+    expect(notificationWantsAttention("some-custom-cli", "anything at all")).toBe(true);
+  });
+
+  it("still lets a user teach termic otherwise for their own build", () => {
+    // The per-agent `attention` list is the documented tuning knob and is
+    // checked FIRST, so this is not a decision taken away from them.
+    mockAgents.push({
+      id: "codex", display_name: "codex", command: "codex", args: [],
+      capabilities: { attention: [], signals: { attention: ["ACTION NEEDED"] } },
+    } as unknown as Agent);
+    expect(notificationWantsAttention("codex", "ACTION NEEDED: approve this")).toBe(true);
+    expect(notificationWantsAttention("codex", "Done. landed.")).toBe(false);
+  });
+
+  it("applies to a CLONE of codex, not just the id", () => {
+    // A duplicated agent runs the same binary and notifies the same way.
+    mockAgents.push(
+      { id: "codex", display_name: "codex", command: "codex", args: [] } as unknown as Agent,
+      { id: "work-codex", display_name: "work codex", command: "codex", args: [], extends: "codex" } as unknown as Agent,
+    );
+    expect(notificationWantsAttention("work-codex", "Done. landed.")).toBe(false);
+  });
+});
+
 // Repo-root resume for codex. Several tasks share one cwd there, so
 // `resume --last` hands the second task the first one's conversation; that is
 // what the id-based path exists to stop.
@@ -924,9 +981,17 @@ describe("classifyAgentTitle", () => {
     });
 
     it("leaves an agent with no allow-list permissive", () => {
-      // Only claude has one. Everything else keeps "a notification means the
-      // agent wants you", which is what asking the terminal to notify means.
-      expect(notificationWantsAttention("codex", "anything at all", [])).toBe(true);
+      // An agent nobody has measured keeps "a notification means the agent
+      // wants you", which is what asking the terminal to notify means.
+      //
+      // This used to use codex as the example, and codex is now the ONE agent
+      // that is measured the other way: its OSC 9 carries the whole final
+      // assistant message at the end of every turn and it never uses OSC 9 for
+      // a permission prompt at all (see NOTIFY_NEVER_ATTENTION). Swapped for an
+      // agent that genuinely has no entry rather than deleted, because the
+      // permissive default is still the rule and still needs a test.
+      expect(notificationWantsAttention("grok", "anything at all", [])).toBe(true);
+      expect(notificationWantsAttention("some-future-cli", "anything at all", [])).toBe(true);
     });
 
     it("still lets a user's own attention list win", () => {

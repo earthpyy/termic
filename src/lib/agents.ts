@@ -582,6 +582,32 @@ export const BUILTIN_NOTIFY_ATTENTION: Record<string, string[]> = {
   claude: ["needs your", "needs permission"],
 };
 
+/** Agents whose notifications are ANNOUNCEMENTS, never requests for the user.
+ *
+ *  Not an allow-list with no entries: an empty list falls through to "anything
+ *  counts", which is the default for an agent nobody has measured and is the
+ *  right default. This is the opposite claim, and it has to be made explicitly.
+ *
+ *  codex is here because its `OSC 9` carries its ENTIRE final assistant message
+ *  at the end of every turn. Four consecutive bodies off a real session, all of
+ *  them prose ("Done. Quick SEO pass landed: ...", "Read /etc/hosts
+ *  successfully...", "I'm here. What do you want me to do next?"), and none of
+ *  them a request for anything. Treating those as needs-you put a bell on the
+ *  end of every codex turn.
+ *
+ *  And it never uses `OSC 9` for the state that WOULD deserve one: driving a
+ *  live codex to a permission prompt produced 80 `OSC 0` titles, one `OSC 10`,
+ *  one `OSC 11` and zero `OSC 9`. Its needs-you is the `Action Required` title
+ *  plus the `PermissionRequest` hook, both of which termic already reads.
+ *
+ *  WHY THIS ONLY APPEARED WITH HOOKS, since that is the confusing part: the
+ *  body was always chatter, but `notifyAttention` drops a notification that
+ *  arrives while the tab still reads `working`, and without hooks the title
+ *  kept it there. A hook `133;D` lands ~50ms AHEAD of the `OSC 9` (measured off
+ *  the same turn), so the tab is already `done` when the notification arrives
+ *  and the guard that used to swallow it no longer applies. Wiring codex hooks
+ *  is what exposed it. */
+export const NOTIFY_NEVER_ATTENTION: string[] = ["codex"];
 
 /** Whether a notification body should raise attention. Defaults to `true` for
  *  unknown agents and unknown bodies: an agent that explicitly asked the
@@ -600,10 +626,15 @@ export function notificationWantsAttention(
   // semantics an agent that spams notifications would have no way to opt out.
   const attn = compileSignals(resolveAgent(agents, cli)?.capabilities?.signals?.attention);
   if (attn.length) return attn.some(re => re.test(text));
+  const base = builtinBaseId(cli, agents);
+  // Measured to be announcements rather than requests. Checked AFTER the user's
+  // own list so they can still teach termic otherwise for their own build, and
+  // before the built-in lists because for these agents there is nothing a body
+  // could say that would make it a needs-you.
+  if (NOTIFY_NEVER_ATTENTION.includes(base)) return false;
   // Built-in allow-list, when the agent has one. Checked before the ignore
   // list so a body has to look like a request for the user, rather than merely
   // avoiding the handful of phrases we thought to exclude.
-  const base = builtinBaseId(cli, agents);
   const builtinAttn = compileSignals(BUILTIN_NOTIFY_ATTENTION[base]);
   if (builtinAttn.length && !builtinAttn.some(re => re.test(text))) return false;
   return !compileSignals(BUILTIN_NOTIFY_IGNORE[base]).some(re => re.test(text));
