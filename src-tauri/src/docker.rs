@@ -1184,24 +1184,125 @@ pub fn dockerfile_path() -> PathBuf {
 /// customization surface.
 pub const DEFAULT_DOCKERFILE: &str = include_str!("../assets/Dockerfile.default");
 
-/// Read the current Dockerfile, falling back to (and persisting) the
-/// shipped default on first run / missing file.
-pub fn read_dockerfile() -> String {
-    let path = dockerfile_path();
-    match std::fs::read_to_string(&path) {
-        Ok(s) if !s.trim().is_empty() => s,
-        _ => {
-            let _ = write_dockerfile(DEFAULT_DOCKERFILE);
-            DEFAULT_DOCKERFILE.to_string()
-        }
+/// Which shipped default the saved Dockerfile was written FROM.
+///
+/// This file is the whole point of the mechanism. "Has the user customised
+/// their Dockerfile" used to be answered by comparing their file to the
+/// CURRENT default, which is a different question and gives the wrong answer
+/// every time termic ships a new one: adding an agent to `Dockerfile.default`
+/// instantly reported every untouched Dockerfile as customised, and the only
+/// way out offered was "Reset to default" - which is exactly what someone who
+/// HAD customised it must not click. Reported after Muse Code was added.
+///
+/// So provenance is stored rather than inferred. The file holds a generation
+/// number and the default it came from; a saved Dockerfile still equal to its
+/// recorded origin was never edited, whatever the current default says, and
+/// can be upgraded in place.
+fn dockerfile_origin_path() -> PathBuf {
+    docker_dir().join("Dockerfile.origin")
+}
+
+/// Bump to force EVERY saved Dockerfile back to the shipped default on the
+/// next launch, user edits included.
+///
+/// A blunt instrument, and deliberately: it exists for the release where the
+/// shipped file changes in a way an old one cannot be left behind on (a broken
+/// base image, a security fix, an agent install that must be present). It is
+/// NOT how ordinary updates flow - those reach an unedited file through
+/// `read_dockerfile` without touching a customised one.
+///
+/// Generation 1 is the introduction of this mechanism itself: every profile
+/// predating it has an unknown origin, so there is no way to tell an edited
+/// file from one merely written by an older termic, and the maintainer asked
+/// for one clean sweep to a known-good state.
+const DOCKERFILE_GENERATION: u32 = 1;
+
+#[derive(Serialize, Deserialize, Default)]
+struct DockerfileOrigin {
+    /// `DOCKERFILE_GENERATION` at the time this file was written.
+    generation: u32,
+    /// The shipped default this Dockerfile was created from, verbatim. Stored
+    /// whole rather than hashed so a future termic can DIFF against it and
+    /// show the user what they changed.
+    default_text: String,
+}
+
+fn read_origin() -> Option<DockerfileOrigin> {
+    let raw = std::fs::read_to_string(dockerfile_origin_path()).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn write_origin(default_text: &str) {
+    let o = DockerfileOrigin {
+        generation: DOCKERFILE_GENERATION,
+        default_text: default_text.to_string(),
+    };
+    if let Ok(j) = serde_json::to_string_pretty(&o) {
+        let _ = std::fs::create_dir_all(docker_dir());
+        let _ = std::fs::write(dockerfile_origin_path(), j);
     }
 }
 
+/// True when the saved Dockerfile is the user's own work rather than a shipped
+/// one. See `dockerfile_origin_path`.
+pub fn dockerfile_is_customised() -> bool {
+    let Ok(saved) = std::fs::read_to_string(dockerfile_path()) else { return false };
+    match read_origin() {
+        // Unedited iff it still matches the default it was created from.
+        Some(o) => saved != o.default_text,
+        // No provenance: a profile from before this existed. Fall back to the
+        // old comparison, which is right for anyone who never edited theirs
+        // and wrong only until the next generation sweep resets it anyway.
+        None => saved != DEFAULT_DOCKERFILE,
+    }
+}
+
+/// Read the current Dockerfile, falling back to (and persisting) the
+/// shipped default on first run / missing file.
+///
+/// Also where an unedited Dockerfile picks up a NEW shipped default. Doing it
+/// on read rather than in a migration keeps one code path: whoever asks for the
+/// Dockerfile gets the current one, and a customised file is never touched.
+pub fn read_dockerfile() -> String {
+    let path = dockerfile_path();
+    let saved = match std::fs::read_to_string(&path) {
+        Ok(s) if !s.trim().is_empty() => s,
+        _ => {
+            let _ = write_dockerfile(DEFAULT_DOCKERFILE);
+            return DEFAULT_DOCKERFILE.to_string();
+        }
+    };
+    if saved == DEFAULT_DOCKERFILE {
+        // Already current. Record provenance if this profile predates it, so
+        // the next shipped default can flow in without a forced sweep.
+        if read_origin().is_none() {
+            write_origin(DEFAULT_DOCKERFILE);
+        }
+        return saved;
+    }
+    let origin = read_origin();
+    let forced = origin.as_ref().map(|o| o.generation < DOCKERFILE_GENERATION).unwrap_or(true);
+    let unedited = origin.as_ref().is_some_and(|o| saved == o.default_text);
+    if forced || unedited {
+        let _ = write_dockerfile(DEFAULT_DOCKERFILE);
+        return DEFAULT_DOCKERFILE.to_string();
+    }
+    saved
+}
+
 /// Persist an edited Dockerfile.
+///
+/// Writing the shipped default (which is what "Reset to default" does) also
+/// re-records provenance, so a reset returns the file to "not customised"
+/// rather than leaving it permanently flagged.
 pub fn write_dockerfile(contents: &str) -> Result<(), String> {
     let dir = docker_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    std::fs::write(dir.join("Dockerfile"), contents).map_err(|e| e.to_string())
+    std::fs::write(dir.join("Dockerfile"), contents).map_err(|e| e.to_string())?;
+    if contents == DEFAULT_DOCKERFILE {
+        write_origin(DEFAULT_DOCKERFILE);
+    }
+    Ok(())
 }
 
 // ──────────────────────────── Image build ──────────────────────────────
@@ -1424,7 +1525,9 @@ pub fn image_status() -> DockerImageStatus {
     DockerImageStatus {
         current_tag,
         current_built,
-        is_default: dockerfile == DEFAULT_DOCKERFILE,
+        // Provenance, not a comparison against the CURRENT default: a new
+        // shipped Dockerfile must not report every untouched one as edited.
+        is_default: !dockerfile_is_customised(),
         // Dropdown availability: any usable built image (current OR the
         // last-built one we keep around after an edit).
         available: current_built || last_built_exists,
@@ -2626,6 +2729,12 @@ mod tests {
         });
     }
 
+    /// Dockerfile provenance, all four scenarios in ONE test on purpose.
+    ///
+    /// `data_dir()` is chosen by `TERMIC_DATA_DIR`, which is process-wide, and
+    /// cargo runs tests in parallel threads: four separate tests each setting
+    /// it raced and read each other's Dockerfile. One sequential test is the
+    /// honest fix; a mutex would only hide the sharing from the reader.
     #[test]
     fn muse_sessions_are_mounted_so_they_survive_a_container() {
         // A container is `--rm`, so anything muse writes outside a mount is
@@ -2650,6 +2759,49 @@ mod tests {
         assert_eq!(host_subpath_for("/root/.local/share/muse"), "local/share/muse");
     }
 
+    #[test]
+    fn dockerfile_provenance_survives_a_new_shipped_default() {
+        let dir = std::env::temp_dir().join(format!("termic-df-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("TERMIC_DATA_DIR", &dir);
+
+        let old_default = "FROM node:lts-bookworm\n# an older shipped file\n";
+
+        // 1. THE bug. `is_default` used to be `saved == DEFAULT_DOCKERFILE`, so
+        //    shipping a new default reported every untouched Dockerfile as the
+        //    user's own work and offered "Reset to default" as the only way
+        //    out - the one button someone who HAD customised must not press.
+        write_dockerfile(old_default).unwrap();
+        write_origin(old_default);
+        assert!(!dockerfile_is_customised(), "never edited, so not customised");
+        assert_eq!(read_dockerfile(), DEFAULT_DOCKERFILE, "an unedited file upgrades in place");
+        assert!(!dockerfile_is_customised(), "and is still not customised after it");
+
+        // 2. An edited file is never overwritten, and keeps saying so.
+        let mine = format!("{old_default}RUN npm install -g my-own-tool\n");
+        write_origin(old_default);
+        write_dockerfile(&mine).unwrap();
+        assert!(dockerfile_is_customised());
+        assert_eq!(read_dockerfile(), mine, "the user's edits survive an upgrade");
+        assert!(dockerfile_is_customised());
+
+        // 3. Reset clears the flag, or a customised file stays flagged forever.
+        write_dockerfile(DEFAULT_DOCKERFILE).unwrap();
+        assert!(!dockerfile_is_customised(), "a reset must not stay flagged");
+
+        // 4. The blunt instrument: no provenance at all (a profile predating
+        //    this) is swept, because nothing there distinguishes a user edit
+        //    from an older termic's write.
+        std::fs::remove_file(dockerfile_origin_path()).unwrap();
+        write_dockerfile("FROM scratch\n# entirely mine\n").unwrap();
+        let _ = std::fs::remove_file(dockerfile_origin_path());
+        assert_eq!(read_dockerfile(), DEFAULT_DOCKERFILE, "swept to the shipped default");
+        assert!(!dockerfile_is_customised());
+
+        std::env::remove_var("TERMIC_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_stale_allowed_path_is_skipped_instead_of_failing_the_whole_run() {
