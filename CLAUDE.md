@@ -175,6 +175,7 @@ Deeper references — read when working in that area:
 - [docs/tech-debt.md](docs/tech-debt.md) — index of temporary/removable scaffolding (e.g. the workspace→task migration) + purge checklists
 - [docs/performance.md](docs/performance.md) — perf traps, sub-pixel/rendering hardening, what is measured where (`make perf`)
 - [docs/perf-ci.md](docs/perf-ci.md) — why counts gate PRs and timings only run nightly; what Orca actually does
+- [docs/adding-an-agent.md](docs/adding-an-agent.md) — runbook for adding a built-in agent: what to measure before writing a default, and every table/file that has to move together
 - [docs/agent-hooks.md](docs/agent-hooks.md) — agent hooks: what each agent reports, the transport (including Docker), and the measurements behind both
 - [docs/sandbox.md](docs/sandbox.md) — sandbox-exec + CONNECT proxy, YOLO interaction, deny debugging
 - [docs/shortcuts.md](docs/shortcuts.md) — shortcut system architecture, adding shortcuts, glyph rendering
