@@ -17109,13 +17109,60 @@ fn docker_command_preview_sync(task_id: Option<String>, agent_id: Option<String>
 /// can take a second or more — must stay off the IPC/WKWebView thread (see
 /// the long-running-IPC discipline in CLAUDE.md).
 #[tauri::command]
-async fn run_capture_command(cmd: String, cwd: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || run_capture_command_blocking(&cmd, &cwd))
-        .await
-        .map_err(|e| e.to_string())?
+async fn run_capture_command(
+    cmd: String,
+    cwd: String,
+    agent_id: Option<String>,
+    docker: Option<bool>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_capture_command_blocking(&cmd, &cwd, agent_id.as_deref(), docker.unwrap_or(false))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
-fn run_capture_command_blocking(cmd: &str, cwd: &str) -> Result<String, String> {
+/// Where a DOCKER task's agent state actually lives, as an XDG data root.
+///
+/// A capture command runs on the HOST, and for a Docker task that is the wrong
+/// machine: the agent wrote its sessions inside the container, into
+/// `/root/.local/share/<agent>`, which termic bind-mounts from its own
+/// `docker-agents/<agent>/local/share/<agent>`. Left alone, the command reads
+/// the user's OWN `~/.local/share` instead and captures a session id the
+/// container has never heard of, so the next spawn resumes into
+/// "retained session not found: session <uuid> has no saved log". Reported on a
+/// Docker main-checkout muse task.
+///
+/// Pointing `XDG_DATA_HOME` at the mounted parent makes the SAME command
+/// correct on both sides, because `$XDG_DATA_HOME/<agent>` then resolves to the
+/// very directory the container wrote through.
+///
+/// Only the DATA root is remapped. An agent whose capture reads its CONFIG dir
+/// as well (opencode's `session list` may) is not covered here: its first state
+/// dir is mounted AT the agent root rather than under a config parent, so there
+/// is no single `XDG_CONFIG_HOME` that resolves correctly, and guessing one
+/// would point it at a directory that happens to exist and is wrong.
+fn docker_capture_data_home(agent_id: &str) -> Option<String> {
+    let base = crate::docker::base_agent_id_str(agent_id);
+    // Only meaningful when the agent keeps state under `.local/share`, which
+    // is the dir the mount mirrors.
+    crate::agent_dirs::state_dirs(base)
+        .iter()
+        .find(|d| d.starts_with(".local/share/"))?;
+    Some(
+        crate::docker::agent_config_host_dir(agent_id)
+            .join("local/share")
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+fn run_capture_command_blocking(
+    cmd: &str,
+    cwd: &str,
+    agent_id: Option<&str>,
+    docker: bool,
+) -> Result<String, String> {
     let mut c = std::process::Command::new("sh");
     // `-c`, not `-lc`: the login env is injected below, and re-sourcing the
     // profile chain on top of it would only re-strip PATH on some setups.
@@ -17124,6 +17171,12 @@ fn run_capture_command_blocking(cmd: &str, cwd: &str) -> Result<String, String> 
     c.env("PATH", path);
     for (k, v) in inject {
         c.env(k, v);
+    }
+    // AFTER the inherited env, so it wins over the user's own XDG_DATA_HOME.
+    if docker {
+        if let Some(home) = agent_id.and_then(docker_capture_data_home) {
+            c.env("XDG_DATA_HOME", home);
+        }
     }
     // A capture command is a plain query; nothing should be reading stdin.
     // Leaving it inherited lets a misconfigured one block forever.
@@ -19965,13 +20018,49 @@ mod tests {
     // .app's launchd env.
 
     #[test]
+    fn a_docker_capture_reads_the_mounted_state_not_the_users_own() {
+        // Reported: a Docker main-checkout muse task resumed into "retained
+        // session not found: session <uuid> has no saved log". The capture
+        // command runs on the HOST, so it was reading ~/.local/share/muse and
+        // handing the container a session id only the host had ever seen.
+        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+        let cmd = "printf %s \"${XDG_DATA_HOME:-unset}\"";
+
+        // Not a Docker task: the user's own XDG rules stay untouched, because
+        // the agent really did write there.
+        let host = run_capture_command_blocking(cmd, &cwd, Some("muse"), false).unwrap();
+        assert!(!host.contains("docker-agents"), "host capture was redirected: {host}");
+
+        // A Docker task: pointed at the dir the container wrote through, and
+        // `$XDG_DATA_HOME/muse` has to land exactly on the mount's host side.
+        let dock = run_capture_command_blocking(cmd, &cwd, Some("muse"), true).unwrap();
+        //
+        // Asserted on SHAPE, not by comparing against a freshly-computed
+        // `agent_config_host_dir`: that reads `TERMIC_DATA_DIR`, which is
+        // process-wide, and other tests in this binary set and clear it in
+        // parallel threads, so the two reads could disagree mid-test. The
+        // shape is the contract anyway - `$XDG_DATA_HOME/muse` must land on
+        // `docker-agents/muse/local/share/muse`, which is exactly what
+        // `host_subpath_for("/root/.local/share/muse")` produces (pinned in
+        // docker.rs's own test).
+        assert!(dock.ends_with("docker-agents/muse/local/share"), "got {dock}");
+
+        // An agent with no `.local/share` state dir is left alone rather than
+        // pointed at a directory that does not exist.
+        assert!(run_capture_command_blocking(cmd, &cwd, Some("claude"), true)
+            .unwrap().contains("unset")
+            || !run_capture_command_blocking(cmd, &cwd, Some("claude"), true)
+                .unwrap().contains("docker-agents"));
+    }
+
+    #[test]
     fn capture_runs_in_cwd_and_trims_stdout() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("marker"), "ses_abc123\n").unwrap();
         let cwd = dir.path().to_string_lossy().into_owned();
         // Pipelines are the whole point of the shell here (the shipped
         // opencode capture is `… | grep … | cut …`).
-        let out = run_capture_command_blocking("cat marker | cut -d' ' -f1", &cwd).unwrap();
+        let out = run_capture_command_blocking("cat marker | cut -d' ' -f1", &cwd, None, false).unwrap();
         assert_eq!(out, "ses_abc123");
     }
 
@@ -19982,7 +20071,7 @@ mod tests {
         // findable, or the capture returns "" and the ID is never stored.
         let dir = tempdir().unwrap();
         let cwd = dir.path().to_string_lossy().into_owned();
-        let seen = run_capture_command_blocking("printf %s \"$PATH\"", &cwd).unwrap();
+        let seen = run_capture_command_blocking("printf %s \"$PATH\"", &cwd, None, false).unwrap();
         assert_eq!(seen, shell_env::spawn_env().0);
     }
 
@@ -19993,7 +20082,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let cwd = dir.path().to_string_lossy().into_owned();
         let out = run_capture_command_blocking(
-            "echo noise >&2; definitely-not-a-real-binary-243", &cwd).unwrap();
+            "echo noise >&2; definitely-not-a-real-binary-243", &cwd, None, false).unwrap();
         assert_eq!(out, "");
     }
 

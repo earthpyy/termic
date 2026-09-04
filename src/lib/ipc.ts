@@ -494,8 +494,12 @@ export const agentsDefaults = () => invoke<import("@/lib/types").Agent[]>("agent
 /** Run a shell command in `cwd` via `sh -lc` and return trimmed stdout.
  *  Used by post_launch_capture to harvest the CLI's session ID after the
  *  agent creates its first session. */
-export const runCaptureCommand = (cmd: string, cwd: string) =>
-  invoke<string>("run_capture_command", { cmd, cwd });
+/** `agentId` + `docker` let Rust point the command at the agent state a DOCKER
+ *  task actually wrote, which lives in termic's mounted dir rather than the
+ *  user's own `~/.local/share`. Without them a Docker capture returns a host
+ *  session id the container cannot resume. */
+export const runCaptureCommand = (cmd: string, cwd: string, agentId?: string, docker?: boolean) =>
+  invoke<string>("run_capture_command", { cmd, cwd, agentId, docker });
 export const taskDiff     = (id: string) => invoke<TaskDiffSummary>("task_diff", { id });
 export const taskSendDiffToMain = (id: string) =>
   invoke<{ tracked_files: number; untracked_files: number }>("task_send_diff_to_main", { id });

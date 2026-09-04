@@ -1940,7 +1940,14 @@ const captureArmedRef = useRef(false);
       const capture = postLaunchCaptureForCli(tab.cli);
       if (!capture) return;
       dbg("session-capture", `${reason}: running \`${capture.command}\` in ${task.path}`);
-      ipc.runCaptureCommand(capture.command, task.path)
+      // The agent + docker flag matter: a Docker task's sessions were written
+      // INSIDE the container, into termic's mounted dir, not the user's own
+      // ~/.local/share. Without them the capture returns a host session id the
+      // container cannot resume ("retained session not found").
+      ipc.runCaptureCommand(
+        capture.command, task.path, tab.cli,
+        !!useApp.getState().tasks.find(t => t.id === task.id)?.docker_sandbox_enabled,
+      )
         .then(id => {
           if (id) {
             dbg("session-capture", `${reason}: captured ${id}`);
