@@ -26,7 +26,7 @@
 
 use serde::Serialize;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -129,6 +129,29 @@ pub fn parse_codex_result(result: &serde_json::Value) -> AgentUsage {
     }
 }
 
+/// The `codex app-server` invocation, built separately so a test can read its
+/// ENVIRONMENT back without needing a codex on the machine.
+///
+/// It exists because of a bug that shipped. A packaged `.app` is launched by
+/// the GUI with `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, and codex installs to
+/// `~/.local/bin`, so `Command::new("codex")` is a plain ENOENT in every
+/// release build while working in every dev one, where the terminal's PATH is
+/// inherited. The frontend swallows this error on purpose, so the footer was
+/// simply empty for codex with nothing anywhere saying why.
+///
+/// `shell_env` exists for exactly this and its module doc says so; the fix is
+/// to use it, and the test below is what stops it being dropped again.
+fn app_server_command(bin: &str, home: &Path) -> Command {
+    let mut cmd = Command::new(bin);
+    cmd.arg("app-server")
+        .env("PATH", crate::shell_env::resolved_path())
+        .env("CODEX_HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    cmd
+}
+
 /// One `initialize` + one `account/rateLimits/read` over stdio, then kill the
 /// child.
 ///
@@ -137,18 +160,21 @@ pub fn parse_codex_result(result: &serde_json::Value) -> AgentUsage {
 /// hazard: the app-server is a long-lived JSON-RPC peer, termic wants one
 /// answer, and a child that never answers would otherwise hang a caller with
 /// the pipe still open.
-pub fn fetch_codex(agent_id: &str) -> Result<AgentUsage, String> {
-    let home = codex_home(agent_id)?;
+pub fn fetch_codex(agent_id: &str, docker: bool) -> Result<AgentUsage, String> {
+    let home = codex_home(agent_id, docker)?;
     let bin = codex_binary(agent_id);
 
-    let mut child = Command::new(&bin)
-        .arg("app-server")
-        .env("CODEX_HOME", &home)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+    let mut child = app_server_command(&bin, &home)
         .spawn()
-        .map_err(|e| format!("could not start `{bin} app-server`: {e}"))?;
+        .map_err(|e| {
+            // Logged, not just returned. The caller swallows this error on
+            // purpose (a missing codex must not raise a banner over a footer
+            // number), so without a trace here a total failure is invisible,
+            // which is precisely how it reached a release.
+            let msg = format!("could not start `{bin} app-server`: {e}");
+            crate::dlog(&format!("[agent-usage] {msg}"));
+            msg
+        })?;
 
     {
         let stdin = child.stdin.as_mut().ok_or("no stdin on codex app-server")?;
@@ -200,7 +226,15 @@ pub fn fetch_codex(agent_id: &str) -> Result<AgentUsage, String> {
 /// clone points codex at a second account, and `instance_config_dir` already
 /// resolves that from the agent ENTRY, so a clone is asked about its own login
 /// rather than the base's.
-fn codex_home(agent_id: &str) -> Result<PathBuf, String> {
+fn codex_home(agent_id: &str, docker: bool) -> Result<PathBuf, String> {
+    // A DOCKER task's codex logs in inside the container, whose CODEX_HOME is
+    // the termic-owned directory bind-mounted at that path. Asking the host's
+    // `~/.codex` instead would report a DIFFERENT ACCOUNT's quota under the
+    // task's name, which is worse than reporting none: the number looks
+    // authoritative and belongs to someone else's login.
+    if docker {
+        return Ok(crate::docker::agent_config_host_dir(agent_id));
+    }
     let home = dirs::home_dir().ok_or("no home dir")?;
     let agents = crate::load_settings_inner().agents;
     crate::agent_dirs::instance_config_dir(&agents, agent_id, &home)
@@ -224,8 +258,8 @@ fn codex_binary(agent_id: &str) -> String {
 /// 10s for it: a synchronous Tauri command doing that blocks the WKWebView
 /// event loop and freezes the whole window (see CLAUDE.md).
 #[tauri::command]
-pub async fn agent_usage_codex(agent_id: String) -> Result<AgentUsage, String> {
-    tauri::async_runtime::spawn_blocking(move || fetch_codex(&agent_id))
+pub async fn agent_usage_codex(agent_id: String, docker: bool) -> Result<AgentUsage, String> {
+    tauri::async_runtime::spawn_blocking(move || fetch_codex(&agent_id, docker))
         .await
         .map_err(|e| format!("usage task failed: {e}"))?
 }
@@ -266,7 +300,7 @@ mod tests {
     #[test]
     #[ignore = "needs a real, logged-in codex binary on PATH"]
     fn codex_rate_limits_live() {
-        let usage = fetch_codex("codex").expect("codex should answer account/rateLimits/read");
+        let usage = fetch_codex("codex", false).expect("codex should answer account/rateLimits/read");
         println!("{}", serde_json::to_string_pretty(&usage).unwrap());
         assert!(
             usage.session.is_some() || usage.weekly.is_some(),
@@ -274,6 +308,50 @@ mod tests {
         );
         for w in [usage.session.as_ref(), usage.weekly.as_ref()].into_iter().flatten() {
             assert!((0.0..=100.0).contains(&w.used_percent), "{w:?}");
+        }
+    }
+
+    /// The regression that shipped in 1.2.1: the spawn inherited the GUI's
+    /// minimal PATH, could not find `codex` in `~/.local/bin`, and the footer
+    /// was silently empty in every release build.
+    ///
+    /// Asserted on the COMMAND rather than by running codex, so it holds on a
+    /// machine that has none, which is every CI runner.
+    #[test]
+    fn the_app_server_spawn_carries_the_login_path() {
+        let cmd = app_server_command("codex", Path::new("/Users/u/.codex"));
+        let envs: Vec<_> = cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_string_lossy().into_owned(),
+                           v.map(|v| v.to_string_lossy().into_owned())))
+            .collect();
+        let path = envs.iter().find(|(k, _)| k == "PATH")
+            .expect("PATH must be set explicitly, never inherited from the GUI");
+        assert!(
+            path.1.as_deref().is_some_and(|p| !p.is_empty()),
+            "PATH was set to nothing, which is worse than not setting it"
+        );
+        assert!(
+            envs.iter().any(|(k, v)| k == "CODEX_HOME"
+                && v.as_deref() == Some("/Users/u/.codex")),
+            "CODEX_HOME is how a clone is asked about its own login: {envs:?}"
+        );
+    }
+
+    /// A Docker task's codex logs in INSIDE the container, against the config
+    /// dir termic mounts there. Asking the host's `~/.codex` would report a
+    /// different account's quota under this task's name, which is worse than
+    /// reporting none: it looks authoritative and belongs to someone else.
+    #[test]
+    fn a_docker_task_is_asked_about_the_mounted_config_dir() {
+        let docker = codex_home("codex", true).expect("docker dir always resolves");
+        assert!(
+            docker.ends_with("docker-agents/codex"),
+            "expected the termic-owned mounted dir, got {}",
+            docker.display()
+        );
+        if let Ok(host) = codex_home("codex", false) {
+            assert_ne!(host, docker);
         }
     }
 

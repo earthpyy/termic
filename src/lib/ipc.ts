@@ -234,9 +234,9 @@ export const sandboxAvailable = () => invoke<boolean>("sandbox_available");
  *  be put on a short timer: see docs/ideas/usage-footer.md.
  *
  *  Keyed by agent ENTRY id so a clone is asked about its own login. */
-export const agentUsageCodex = (agentId: string) =>
+export const agentUsageCodex = (agentId: string, docker: boolean) =>
   invoke<AgentUsage & { planType: string | null; accountId: string | null }>(
-    "agent_usage_codex", { agentId });
+    "agent_usage_codex", { agentId, docker });
 
 /** Per-task deny counters surfaced in the TerminalPane footer
  *  chip. Currently only `network` (the proxy bumps it on every CONNECT

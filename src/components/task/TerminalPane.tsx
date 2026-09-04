@@ -3225,7 +3225,7 @@ export function FooterBar({ task, sandboxWarning }: {
             the sandbox status stays pinned as the rightmost item. It self-hides
             until an account has actually reported, so an agent with no usage
             feed costs this row no width at all. */}
-        <UsageChip agentId={task.cli ?? "claude"} visible={isActiveTask} />
+        <UsageChip agentId={task.cli ?? "claude"} docker={!!task.docker_sandbox_enabled} visible={isActiveTask} />
         {mode !== "off" && total > 0 && (
           <DeniedHostsPopover taskId={task.id} cli={task.cli ?? "claude"} count={total} mode={mode} />
         )}

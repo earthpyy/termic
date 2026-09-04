@@ -37,9 +37,14 @@ const CODEX_REFRESH_MS = 120_000;
  *  otherwise present last night's number as current. */
 const STALE_AFTER_MS = 15 * 60_000;
 
-export function UsageChip({ agentId, visible }: {
+export function UsageChip({ agentId, docker, visible }: {
   /** The agent ENTRY id (a clone keeps its own), which is the account key. */
   agentId: string;
+  /** Is this task caged in Docker? Its codex logs in INSIDE the container, so
+   *  its quota belongs to the config dir termic mounts there, not to the
+   *  host's `~/.codex`. Reporting the host's would put another account's
+   *  number under this task's name. */
+  docker: boolean;
   /** Whether this task is the one on screen. Panes stay MOUNTED when hidden
    *  (they are display:none, never visibility:hidden), so without this every
    *  open task would spawn its own app-server on the same timer. */
@@ -57,22 +62,25 @@ export function UsageChip({ agentId, visible }: {
     if (!isCodex || !visible) return;
     let cancelled = false;
     const ask = () => {
-      ipc.agentUsageCodex(agentId)
+      ipc.agentUsageCodex(agentId, docker)
         .then(u => {
           if (cancelled) return;
           // `report` bails on an unchanged reading, so a refresh that moved
           // nothing costs no store write and no re-render.
           useAgentUsage.getState().report(agentId, { session: u.session, weekly: u.weekly }, "rpc");
         })
-        // Silent. codex may not be installed, may not be logged in, or may be
-        // an older build without the method; none of those is worth a banner
-        // over a footer number, and the chip simply stays absent.
-        .catch(() => {});
+        // No banner: codex may not be installed, may not be logged in, or may
+        // be an older build without the method, and none of those is worth
+        // interrupting anyone over a footer number. But it is LOGGED, because
+        // a silently swallowed failure here is exactly how a release shipped
+        // with the chip never appearing for codex at all (the packaged app's
+        // PATH could not find the binary, and nothing anywhere said so).
+        .catch(err => console.warn("[usage] codex refused:", agentId, err));
     };
     ask();
     const id = window.setInterval(ask, CODEX_REFRESH_MS);
     return () => { cancelled = true; window.clearInterval(id); };
-  }, [agentId, isCodex, visible]);
+  }, [agentId, docker, isCodex, visible]);
 
   // Nothing known yet: render nothing at all rather than a placeholder. An
   // account that has not spoken has no honest number to show, and a row of

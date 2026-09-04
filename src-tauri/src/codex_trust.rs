@@ -137,6 +137,10 @@ fn filter_ours(
 fn hooks_list(codex_bin: &str, codex_home: &Path, cwd: &Path) -> Result<Value, String> {
     let mut child = Command::new(codex_bin)
         .arg("app-server")
+        // The LOGIN-shell PATH. Same trap `agent_usage` hit in a release
+        // build: the GUI hands a packaged app
+        // `/usr/bin:/bin:/usr/sbin:/sbin`, and codex lives in `~/.local/bin`.
+        .env("PATH", crate::shell_env::resolved_path())
         .env("CODEX_HOME", codex_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

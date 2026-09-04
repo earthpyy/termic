@@ -4,7 +4,7 @@ All notable changes to Termic, newest first. This file is the human-authored
 source of truth: the in-app Update card and the /changelog page on termic.dev
 are generated from it. See the `release` skill for how entries are added.
 
-## [1.2.1] - 2026-09-04
+## [1.2.2] - 2026-09-04
 
 Muse Code, Codex self-reporting, and plan usage in the task footer.
 
@@ -40,6 +40,12 @@ Muse Code, Codex self-reporting, and plan usage in the task footer.
 - The agent hooks install preview was empty for a cloned agent, even though
   installing on that clone worked. It now shows the same scripts and config the
   install actually writes.
+- Plan usage now appears for Codex. Termic asks Codex for it by running its
+  binary, and a Termic launched from the Dock does not inherit the PATH your
+  terminal has, so on a released build it could not find Codex at all and the
+  footer stayed empty. A Codex task in a Docker container is also asked about
+  the account that is logged in inside the container, rather than the one on
+  your Mac. ([#277](https://github.com/simion/termic/issues/277))
 - The toolbar's sandbox icon now matches the sidebar, the footer and the mode
   picker for monitoring mode.
 - Settings no longer calls your Docker sandbox Dockerfile "customised" just
