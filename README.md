@@ -406,13 +406,13 @@ specs and get an issue at the same time. That is the whole promotion path:
 
 - **Mobile app.** ([#165](https://github.com/simion/termic/issues/165)) A
   companion app for checking on and steering tasks while away from the Mac.
-- **MCP server endpoint, phases B1 and B2.**
-  ([#176](https://github.com/simion/termic/issues/176)) A scoped control
-  plane an agent can call without being handed a terminal. Phase A (the
-  stateless endpoint, the settings surface, one-click client setup) shipped
-  in 1.0.0; the per-task bearer token that answers which task is calling and
-  what it may do, the narrowest grant a sandboxed agent could be given, is
-  what is left. Design in [docs/plans/mcp.md](docs/plans/mcp.md).
+- **MCP server endpoint, phases B1 and B2.** A scoped control plane an agent
+  can call without being handed a terminal. Phase A (the stateless endpoint,
+  the settings surface, one-click client setup) shipped in 1.0.0; the per-task
+  bearer token that answers which task is calling and what it may do is what is
+  left, and the 2026-07-28 spec revision reopened enough of the design that it
+  is an idea again rather than a plan.
+  [docs/ideas/mcp.md](docs/ideas/mcp.md).
 - **Intentional agent-driven orchestration.** The plumbing already ships:
   an agent can spawn a task with `--wait`, prompt another, read its result
   and branch on the exit code. What is missing is intent, and an opinion
