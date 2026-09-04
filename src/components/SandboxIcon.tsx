@@ -64,15 +64,22 @@ export function sandboxPickerLabel(mode: SandboxMode): string {
   return i === -1 ? l.toUpperCase() : l.slice(0, i).toUpperCase() + l.slice(i);
 }
 
-/** Shared icon renderer. Color + fill come from SANDBOX_VISUALS so they
- *  can never drift between surfaces. `icon` overrides the glyph (the
- *  toolbar uses Eye for monitoring); everything else is canonical.
+/** Shared icon renderer. Glyph, color and fill ALL come from
+ *  SANDBOX_VISUALS, so they cannot drift between surfaces.
+ *
+ *  There is deliberately no per-call glyph override. There was one, used by
+ *  exactly one caller (the toolbar swapped in an Eye for monitoring), and it
+ *  defeated the point of the table: the toolbar is the surface a user reads at
+ *  a glance, and it was the only one disagreeing with the sidebar row, the
+ *  footer chip and the mode picker about what monitoring looks like. A mode
+ *  that wants a different glyph changes `Icon` in the table, where every
+ *  surface picks it up.
+ *
  *  (Activity state is shown by callers via opacity, not fill — fill always
  *  encodes the mode so the two enforce variants stay distinguishable.) */
-export function SandboxIcon({ mode, className, icon, active = true }: {
+export function SandboxIcon({ mode, className, active = true }: {
   mode: SandboxMode;
   className?: string;
-  icon?: LucideIcon;
   /** False = the task isn't currently running an agent - shows the same
    *  faint gray as OFF regardless of mode (enforce green, monitor amber,
    *  etc. are a LIVE status, not a settings badge; a task sitting idle
@@ -81,7 +88,7 @@ export function SandboxIcon({ mode, className, icon, active = true }: {
   active?: boolean;
 }) {
   const v = SANDBOX_VISUALS[mode];
-  const Icon = icon ?? v.Icon;
+  const Icon = v.Icon;
   const color = active ? v.color : "var(--color-fg-faint)";
   return <Icon className={className} style={{ color }} fill={v.filled ? "currentColor" : "none"} />;
 }

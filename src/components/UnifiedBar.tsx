@@ -13,7 +13,7 @@ import * as HoverCard from "@radix-ui/react-hover-card";
 import { Check } from "lucide-react";
 import {
   PanelLeft, PanelRight, FolderOpen, Archive,
-  Sun, Moon, Monitor, ArrowUpToLine, Sunrise, Droplet, Binary, Code2, Eye, Flower2,
+  Sun, Moon, Monitor, ArrowUpToLine, Sunrise, Droplet, Binary, Code2, Flower2,
   MessageSquareText, Library, Palette,
 } from "lucide-react";
 import { CliIcon, CLI_BRAND_COLOR, resolveIconId } from "@/icons/cli";
@@ -318,9 +318,12 @@ export function UnifiedBar() {
                   <Button size="icon" variant="icon"
                     onClick={() => useUI.getState().openSandbox(task.id)}
                   >
-                    {/* Color + fill come from SANDBOX_VISUALS; the toolbar
-                        just swaps the glyph to an Eye for monitoring. */}
-                    <SandboxIcon mode={sbMode} className="h-4 w-4" icon={sbMode === "monitor" ? Eye : undefined} />
+                    {/* Glyph, color and fill ALL come from SANDBOX_VISUALS.
+                        This used to swap in an Eye for monitoring, which made
+                        the one surface a user reads at a glance the only one
+                        disagreeing with the sidebar row, the footer chip and
+                        the mode picker about what monitoring looks like. */}
+                    <SandboxIcon mode={sbMode} className="h-4 w-4" />
                   </Button>
                 </Tip>
               );
