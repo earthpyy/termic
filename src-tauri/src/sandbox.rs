@@ -387,6 +387,25 @@ fn system_read_roots() -> &'static [&'static str] {
         // fail. Read-only (system roots never get file-write*), root-owned, no
         // user secrets — same trust class as /usr and /System/Library.
         "/Library/Developer/CommandLineTools",
+        // The rest of /Library, reads only. Same trust class as the roots
+        // above: root-owned, world-readable system state (frameworks, fonts,
+        // preferences, launch agents), and no USER secrets, which live in
+        // `~/Library` and stay off this list.
+        //
+        // Muse Code is what surfaced it. Under ENFORCING it failed at startup
+        // with "Agent Definition filesystem source failed: IoError", which is
+        // fatal rather than degraded, and the deny it came from is a read
+        // somewhere under /Library. Narrowing was tried and does not work:
+        // enumerating all 74 children of /Library as individual subpaths still
+        // fails, while `subpath "/Library"` or a regex over it succeeds, which
+        // points at macOS firmlink canonicalisation (/Library is really
+        // /System/Volumes/Data/Library) rather than at one identifiable file.
+        // Reproduced deterministically, five runs each way.
+        //
+        // Reads only, and the trailing `(deny ...)` rules still win over it:
+        // termic's own data dir stays denied, as does everything the deny list
+        // covers, because this profile is last-match-wins and those come after.
+        "/Library",
         "/lib", "/lib32", "/lib64", "/libx32",
         "/proc", "/sys", "/run",
     ]
@@ -2150,6 +2169,42 @@ mod mode_env_tests {
 }
 
 #[cfg(test)]
+mod profile_dump {
+    //! Render the real seatbelt profile for one agent to a file, so a cage
+    //! problem can be reproduced by hand instead of guessed at.
+    //!
+    //! This is how the muse `/Library` denial was found, and it is the fastest
+    //! loop there is for "agent X fails under ENFORCING": dump the profile,
+    //! run the agent under `sandbox-exec -f` with it, and watch
+    //! `log stream --predicate 'eventMessage CONTAINS "Sandbox:" AND
+    //! eventMessage CONTAINS "deny"'` in another shell. Note the system log
+    //! DEDUPES violations, so each run usually reveals one new path: expect to
+    //! iterate rather than get the whole list at once.
+    //!
+    //! ```sh
+    //! DUMP_AGENT=muse DUMP_PATH=/path/to/worktree DUMP_OUT=/tmp/a.sb \
+    //!   cargo test --lib profile_dump -- --ignored --nocapture
+    //! cd /path/to/worktree && sandbox-exec -f /tmp/a.sb <agent binary>
+    //! ```
+    #[test]
+    #[ignore = "diagnostic helper, run explicitly with DUMP_* set"]
+    fn dump() {
+        let agent = std::env::var("DUMP_AGENT").unwrap_or_else(|_| "claude".into());
+        let path = std::env::var("DUMP_PATH").expect("DUMP_PATH=<a real directory>");
+        let out = std::env::var("DUMP_OUT").expect("DUMP_OUT=<file to write>");
+        let mut task = crate::Task::default();
+        task.id = "dump".into();
+        task.path = path;
+        task.cli = agent.clone();
+        task.sandbox_enabled = true;
+        let profile = super::render_profile(&task, 8080, Some(&agent),
+                                            crate::SandboxMode::Enforce).unwrap();
+        std::fs::write(&out, profile).unwrap();
+        eprintln!("wrote {out}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2488,6 +2543,26 @@ mod tests {
     }
 
     // ── builtin_runtime_paths ─────────────────────────────────────────
+
+    #[test]
+    fn library_is_a_read_root_but_never_writable() {
+        // Muse Code fails to START under ENFORCING without it: its own error
+        // ("Agent Definition filesystem source failed: IoError") is fatal, not
+        // a degraded feature. /Library is root-owned system state in the same
+        // trust class as /usr and /System/Library, which are already here.
+        assert!(system_read_roots().contains(&"/Library"));
+        // READS only. The list is rendered as file-read* and nothing in it may
+        // ever gain file-write*: /Library holds launch agents, and a writable
+        // one is persistence on the user's machine.
+        let mut task = crate::Task::default();
+        task.id = "t".into();
+        task.path = "/tmp".into();
+        task.sandbox_enabled = true;
+        let p = render_profile_with(&task, 1, "claude", &[], crate::SandboxMode::Enforce,
+                                    &control_plane_paths()).unwrap();
+        assert!(p.contains(r#"(allow file-read* (subpath "/Library"))"#), "{p}");
+        assert!(!p.contains(r#"(allow file-write* (subpath "/Library"))"#), "{p}");
+    }
 
     #[test]
     fn builtin_runtime_paths_contains_task() {
