@@ -613,11 +613,19 @@ describe("termic new --from: adopt an existing worktree (GH #169)", () => {
   });
 
   it("--resume refuses an agent with no id-resume support, naming the gate", async () => {
-    // codex's seeded entry has no resume_id_args, so a seeded id would be
+    // agy's seeded entry has no resume_id_args, so a seeded id would be
     // silently ignored at spawn; the server must refuse instead. Same gate
     // on both verbs.
+    //
+    // This used to use codex, which stopped being an example of the gate the
+    // moment codex learned to resume by id: it now reports the id of the
+    // session it started over its own hook, so `--resume` on codex is a real
+    // request rather than one that could only be dropped on the floor. agy is
+    // the built-in that still cannot, and the gate is keyed on
+    // `resume_id_args` being empty rather than on any agent name, so this
+    // needs an agent that has none, not a rename.
     const viaNew = await rpc({
-      cmd: "new", name: "", from: wtPath, agent: "codex", resume: "SESSION-X",
+      cmd: "new", name: "", from: wtPath, agent: "agy", resume: "SESSION-X",
     });
     expect(viaNew.ok).toBe(false);
     expect(viaNew.error.code).toBe("unsupported");
@@ -626,7 +634,7 @@ describe("termic new --from: adopt an existing worktree (GH #169)", () => {
     const viaTab = await rpc({
       cmd: "tab",
       task: "adopt-me",
-      kind: { tab: "agent", id: "codex" },
+      kind: { tab: "agent", id: "agy" },
       resume: "SESSION-X",
     });
     expect(viaTab.ok).toBe(false);
