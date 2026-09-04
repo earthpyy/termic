@@ -34,6 +34,9 @@ import { resyncViewportAfterReveal } from "@/lib/xtermViewportSync";
 import { IS_MAC, bindingMatches, type ShortcutId } from "@/lib/shortcuts";
 import { registerTerminalDropTarget } from "@/lib/terminalDrop";
 import { HOOK_OSC_TITLE, HOOK_OSC_READY_BODY, hookOscSessionId } from "@/lib/agentHooks";
+import { parseUsageBody } from "@/lib/agentUsage";
+import { UsageChip } from "./UsageChip";
+import { useAgentUsage } from "@/store/agentUsage";
 import { imageFromClipboard, pastePathText } from "@/lib/clipboardImage";
 import { setupImeReplacementBridge } from "@/lib/ime";
 import { deliverMessage, sendMessageToPty } from "@/lib/agentSend";
@@ -1803,6 +1806,26 @@ const captureArmedRef = useRef(false);
         }
         return false;
       }
+      // Subscription usage from claude's termic status line (GH #277). Not a
+      // hook and not a notification: it reports a NUMBER, and nothing about it
+      // should ever badge a tab.
+      //
+      // Routed BEFORE notifyAttention for the same reason the session id is: a
+      // trusted body skips every notification filter by design, so an
+      // unrecognised one falls straight through to a needs-you badge. This body
+      // arrives on EVERY TURN, so getting the order wrong would ring a bell on
+      // every turn of every task.
+      const usage = trusted ? parseUsageBody(body) : null;
+      if (usage) {
+        dbg("osc777-usage", body.slice(0, 200));
+        // Keyed by the AGENT, not the task: a clone holds its own login, and
+        // two tasks on one clone spend the same quota. `report` bails on an
+        // unchanged reading, which matters here more than anywhere else in this
+        // handler (docs/performance.md bear trap 8): most turns move a
+        // percentage by nothing at all.
+        useAgentUsage.getState().report(tab.cli ?? "claude", usage, "statusline");
+        return false;
+      }
       wdlog(`OSC 777 notify${trusted ? " (termic hook)" : ""}`, body);
       dbg("osc777-notify", body.slice(0, 200));
       notifyAttention(`OSC 777 notify`, body, trusted);
@@ -3107,6 +3130,11 @@ export function FooterBar({ task, sandboxWarning }: {
   const splitCollapsed = useApp(s => !!s.terminalSplitCollapsed[task.id]);
   const toggleBottomTerminal = useApp(s => s.toggleBottomTerminal);
   const mode = effectiveSandboxMode(task);
+  // Hidden panes stay MOUNTED (display:none, never visibility:hidden), so a
+  // footer that fetched on mount would have every open task doing it at once.
+  // Selected as a BOOLEAN, not as the id: subscribing to activeTaskId itself
+  // re-renders every task's footer on every task switch.
+  const isActiveTask = useApp(s => s.activeTaskId === task.id);
 
   // no right-split agent queue state needed; split panes show their own queue via SplitView
 
@@ -3192,6 +3220,12 @@ export function FooterBar({ task, sandboxWarning }: {
           bubble to "open Edit dialog." Chip only shows when sandboxed + we've
           actually seen denies. */}
       <div className="ml-auto flex items-center gap-1.5">
+        {/* Subscription usage (GH #277). Leftmost of the right group, so the
+            two things that can APPEAR (usage, "N blocked") grow leftwards and
+            the sandbox status stays pinned as the rightmost item. It self-hides
+            until an account has actually reported, so an agent with no usage
+            feed costs this row no width at all. */}
+        <UsageChip agentId={task.cli ?? "claude"} visible={isActiveTask} />
         {mode !== "off" && total > 0 && (
           <DeniedHostsPopover taskId={task.id} cli={task.cli ?? "claude"} count={total} mode={mode} />
         )}

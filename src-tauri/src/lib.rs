@@ -33,6 +33,7 @@ use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
 pub mod agent_hooks;
+pub mod agent_usage;
 pub mod codex_trust;
 mod sandbox;
 mod proxy;
@@ -18792,6 +18793,7 @@ pub fn run() {
             agent_hooks::agent_hooks_install,
             agent_hooks::agent_hooks_remove,
             agent_hooks::agent_hooks_sync,
+            agent_usage::agent_usage_codex,
             perf_boot_elapsed_ms,
             deep_link_take_pending,
             projects_list, project_add, project_add_multi, project_set_members, project_update, project_remove, project_reorder, project_set_group,

@@ -70,6 +70,13 @@ set_title "✳ ${name}"
 #               day (GH #276).
 #   #osc9 TEXT  emit an OSC 9 notification with a verbatim body, the way claude
 #               asks for the user. BEL-terminated, as claude sends it.
+#   #usage BODY replay what claude's termic STATUS LINE writes: an OSC 777
+#               carrying subscription usage (GH #277). BODY is everything after
+#               the trusted `termic;` sender, e.g. `usage 58 41 - -`. Real
+#               claude sends this on every turn from the script
+#               agent_hooks::statusline_body generates; the wire format is
+#               pinned in lib/agentUsage.ts. It must NEVER badge the tab, which
+#               is the half a spec has to prove.
 #   #bel        emit a REAL bell, distinct from the BEL that terminates an OSC.
 #   #iip        emit an inline PNG, then Pi's alternate-screen redraw.
 #   #hookattn   reproduce a claude PERMISSION PROMPT with termic's agent hook
@@ -157,6 +164,11 @@ while IFS= read -r line; do
       continue ;;
     "#osc9 "*)
       osc9 "${line#\#osc9 }"
+      continue ;;
+    "#usage "*)
+      # Sender field is `termic`, exactly as the generated status line writes
+      # it: the body is only trusted when it is.
+      osc777 "termic;${line#\#usage }"
       continue ;;
     "#bel")
       printf '\007'

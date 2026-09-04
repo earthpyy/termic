@@ -4,9 +4,9 @@ All notable changes to Termic, newest first. This file is the human-authored
 source of truth: the in-app Update card and the /changelog page on termic.dev
 are generated from it. See the `release` skill for how entries are added.
 
-## [1.2.0] - 2026-09-04
+## [1.2.1] - 2026-09-04
 
-Muse Code joins the built-in agents, and Codex now reports its own state.
+Muse Code, Codex self-reporting, and plan usage in the task footer.
 
 ### Features
 - **Muse Code**, Meta's terminal agent, ships as a built-in: launch it, YOLO
@@ -18,6 +18,17 @@ Muse Code joins the built-in agents, and Codex now reports its own state.
 - **Codex resumes the right conversation in a main checkout.** Several tasks
   in one repo root used to share whichever session ran last there; each task
   now returns to its own.
+- **Your plan usage, in the task footer.** How much of the current agent's
+  subscription you have spent, as two percentages and a bar: the rolling
+  session window and the rolling weekly one. The bar turns amber past 70% and
+  red past 90%, following whichever window is closest to its limit, because a
+  comfortable five-hour figure sitting in front of a nearly spent week is the
+  case that catches people out. Click it for the reset times. Claude reports
+  its own numbers through a status line Termic installs alongside the agent
+  hooks (so it needs those turned on, and your own status line is left alone
+  if you have one), and Codex is asked directly. Neither costs you a request.
+  Each cloned agent shows its own account.
+  ([#277](https://github.com/simion/termic/issues/277))
 
 ### Bug fixes
 - One turn interrupts you once. A long turn could raise a desktop notification
@@ -26,6 +37,9 @@ Muse Code joins the built-in agents, and Codex now reports its own state.
   deduplicated. ([#276](https://github.com/simion/termic/issues/276))
 - Claude's needs-you notification names the tool it is blocked on ("needs your
   permission: Bash") instead of "agent needs your input".
+- The agent hooks install preview was empty for a cloned agent, even though
+  installing on that clone worked. It now shows the same scripts and config the
+  install actually writes.
 - The toolbar's sandbox icon now matches the sidebar, the footer and the mode
   picker for monitoring mode.
 - Settings no longer calls your Docker sandbox Dockerfile "customised" just

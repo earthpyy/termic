@@ -3,6 +3,7 @@
 // expects (camelCase vs snake_case quirks handled here so call-sites stay clean).
 
 import { invoke } from "@tauri-apps/api/core";
+import type { AgentUsage } from "@/lib/agentUsage";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   Project, ProjectMember, Task, CreateTaskArgs, CreateMultiArgs, Settings, DiscoveredRepo,
@@ -224,6 +225,18 @@ export const taskSetSandbox = (
  *  banner instead of letting the user enable something that would
  *  crash agent spawn. */
 export const sandboxAvailable = () => invoke<boolean>("sandbox_available");
+
+/** Subscription usage for one codex account (GH #277).
+ *
+ *  codex is ASKED, unlike claude, which reports itself through the status line
+ *  its hook install writes (`lib/agentUsage.ts`). This spawns
+ *  `codex app-server` for one JSON-RPC call, so it is NOT cheap and must never
+ *  be put on a short timer: see docs/ideas/usage-footer.md.
+ *
+ *  Keyed by agent ENTRY id so a clone is asked about its own login. */
+export const agentUsageCodex = (agentId: string) =>
+  invoke<AgentUsage & { planType: string | null; accountId: string | null }>(
+    "agent_usage_codex", { agentId });
 
 /** Per-task deny counters surfaced in the TerminalPane footer
  *  chip. Currently only `network` (the proxy bumps it on every CONNECT

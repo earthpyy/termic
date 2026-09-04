@@ -1130,6 +1130,67 @@ describe("agent notifications", () => {
     expect(await sidebarBadge(taskId!)).not.toBe("done");
   });
 
+  // The usage footer (GH #277), end to end through the real OSC chain.
+  //
+  // ONE submit, and deliberately so. The threshold table, the driving-window
+  // rule and the parse are covered exhaustively in `lib/agentUsage.test.ts`,
+  // which runs in milliseconds; what only a real window can prove is the
+  // CHAIN, and that costs an agent round trip per assertion. An earlier
+  // version of this walked four thresholds through four submits and blew
+  // mocha's 60s budget, which is a slow suite buying nothing the unit test had
+  // not already said.
+  //
+  // The body is chosen to prove two things at once: the chip renders both
+  // numbers, and the colour follows the window CLOSEST TO ITS LIMIT rather
+  // than the session one. 30% of five hours in front of 95% of the week has to
+  // read as critical, or the footer reports comfort until the turn that fails.
+  it("shows plan usage in the footer, coloured by the window nearest its limit", async () => {
+    await ensureActiveTask(taskId!);
+    await submitToAgent(taskId!, "#usage usage 30 95 - -");
+
+    const chip = await browser.$('[data-testid="usage-chip"]');
+    await chip.waitForExist({ timeout: 20_000 });
+    // The numbers the USER reads, not the store field behind them.
+    expect(await chip.getAttribute("data-usage-session")).toBe("30");
+    expect(await chip.getAttribute("data-usage-weekly")).toBe("95");
+    expect(await chip.getAttribute("data-usage-source")).toBe("statusline");
+    expect(await chip.getAttribute("data-usage-level")).toBe("critical");
+    expect(await chip.getText()).toContain("30%");
+    expect(await chip.getText()).toContain("95%");
+    expect(await (await browser.$('[data-testid="usage-bar-fill"]')).isExisting()).toBe(true);
+  });
+
+  // The half that is easy to get wrong and expensive to ship wrong. A trusted
+  // body skips every notification filter by design, so a usage report routed
+  // one branch too late falls through to notifyAttention and badges the tab.
+  // This body arrives on every turn of every task, so that bug would mean a
+  // bell per turn, forever.
+  //
+  // The quiet wait is what makes it a real check rather than a race the spec
+  // happens to win, and it is the reason this is a second `it` rather than
+  // another assertion on the first: the cost buys something no unit test can.
+  it("never badges the tab for a usage report", async () => {
+    await ensureActiveTask(taskId!);
+    await browser.execute((id) => {
+      const s = window.__termic!.useApp.getState();
+      s.clearAttention(id, s.tabs[id][0].id);
+    }, taskId);
+    await setWindowPresence(false);
+
+    await submitToAgent(taskId!, "#usage usage 61 44 - -");
+    await browser.waitUntil(async () => {
+      const el = await browser.$('[data-testid="usage-chip"]');
+      return (await el.isExisting()) && (await el.getAttribute("data-usage-session")) === "61";
+    }, { timeout: 20_000, timeoutMsg: "the second usage report never landed" });
+
+    await browser.waitUntil(async () => (await quietFor(taskId!)) > 6_000, {
+      timeout: 30_000, interval: 500,
+      timeoutMsg: "PTY never went quiet after the usage report",
+    });
+    expect(await taskViewBadge(taskId!)).not.toBe("attention");
+    expect(await sidebarBadge(taskId!)).not.toBe("attention");
+  });
+
   // Looking at a tab is how you read its badge. `markAttention` marks
   // unconditionally, focused tab included, and the badge then cleared only on
   // a keystroke in that terminal or on re-activating the task, so the common

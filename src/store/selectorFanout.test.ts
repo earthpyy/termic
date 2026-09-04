@@ -37,6 +37,7 @@ vi.mock("@/lib/tabFocus", () => ({
 }));
 
 import { useApp, selectTaskTabs, selectActiveTabId, EMPTY_TABS } from "@/store/app";
+import { useAgentUsage } from "@/store/agentUsage";
 import type { AppState } from "@/store/app";
 import type { Tab } from "@/lib/types";
 
@@ -148,6 +149,63 @@ describe("selector fan-out budget (bear trap 5)", () => {
     expect(selectTaskTabs("nope")(s)).toBe(selectTaskTabs("other")(s));
     expect(selectTaskTabs(null)(s)).toBe(EMPTY_TABS);
     expect(Object.isFrozen(EMPTY_TABS)).toBe(true);
+  });
+
+  // ── Subscription usage (GH #277) ───────────────────────────────────
+  //
+  // The usage feed is the newest thing on a hot path: claude's status line
+  // reports on every turn, on every running task at once. Two invariants keep
+  // that from becoming a per-turn re-render of the whole window, and both are
+  // counts, so they survive a 3-core CI runner.
+
+  it("a usage report invalidates NO useApp selector", () => {
+    // The design decision this pins: usage lives in its OWN store, not in
+    // useApp's ~233-key state. Putting it there would mean every status line
+    // report copies that whole object and re-runs every mounted tab bar's
+    // selector, which is bear trap 8 arriving once per turn per task.
+    const seeded = Array.from({ length: SUBSCRIBERS }, (_, i) => `task-${i}`);
+    useApp.setState({ tabs: Object.fromEntries(seeded.map(id => [id, [tab(`${id}-a`)]])) });
+    const subs = seeded.map(id => selectTaskTabs(id));
+
+    const r = measureFanout(subs, WRITES, i =>
+      useAgentUsage.getState().report(
+        "claude", { session: { usedPercent: i % 100, resetsAt: null }, weekly: null }, "statusline"));
+
+    expect(r.invalidations).toBe(0);
+    expect(r.selectorRuns).toBe(0);
+  });
+
+  it("a usage report reaches only the footers on that agent", () => {
+    useAgentUsage.setState({ byAgent: {} });
+    // A window of tasks split across two accounts: a claude clone holding a
+    // second login must not re-render when the first one's quota moves.
+    const agents = Array.from({ length: SUBSCRIBERS }, (_, i) =>
+      i % 2 === 0 ? "claude" : "next-claude");
+
+    let runs = 0, invalidations = 0;
+    const snap = agents.map(a => useAgentUsage.getState().byAgent[a]);
+    const unsub = useAgentUsage.subscribe(() => {
+      for (let i = 0; i < agents.length; i++) {
+        runs++;
+        const next = useAgentUsage.getState().byAgent[agents[i]];
+        if (!Object.is(next, snap[i])) { invalidations++; snap[i] = next; }
+      }
+    });
+
+    useAgentUsage.getState().report(
+      "claude", { session: { usedPercent: 1, resetsAt: null }, weekly: null }, "statusline");
+    expect(invalidations).toBe(SUBSCRIBERS / 2);
+
+    // The same reading again. Most turns move a percentage by nothing, so this
+    // is the COMMON case, and it must cost zero notifications: the bail in
+    // `report` means no subscriber is even woken.
+    const runsAfterFirst = runs;
+    useAgentUsage.getState().report(
+      "claude", { session: { usedPercent: 1, resetsAt: null }, weekly: null }, "statusline");
+    expect(runs).toBe(runsAfterFirst);
+    expect(invalidations).toBe(SUBSCRIBERS / 2);
+
+    unsub();
   });
 
   it("activeTab selectors are undefined-stable for unknown tasks", () => {

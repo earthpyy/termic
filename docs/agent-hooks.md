@@ -535,6 +535,89 @@ unattended upgrade should actually be asking. It is safe as a gate because
 reads false and is never re-installed behind their back. Pinned by
 `an_install_missing_a_newly_added_event_is_still_ours`.
 
+## The status line is not a hook, and rides the same channel anyway
+
+claude's usage feed (GH #277) is installed by the same `install` call, into the
+same config file and the same script dir, and writes the same OSC 777 with the
+same trusted `termic` title. It is NOT in `hooks_for`, is not registered against
+an event, and `installed` must never depend on it: `status()` answers about
+hooks, and a config whose statusLine slot was already taken is still a complete
+hook install.
+
+**Claude Code pipes `rate_limits` into a statusLine command's stdin on every
+turn**, piggybacked on the Messages API response, so reading it costs no request
+and no rate-limit budget. Measured on 2.1.260, the payload also carries
+`context_window`, `cost`, `model` and `session_id`.
+
+Three things about it were measured rather than assumed, and each one would have
+killed the approach if it had gone the other way:
+
+- **Whatever the script prints is RENDERED**, under the user's input box, every
+  turn. A probe printing `ZZMARKERZZ` put `ZZMARKERZZ` on screen. A probe
+  printing an empty string left no text at all, which is what makes the slot
+  usable as a pure data channel: the numbers go out the side, stdout stays
+  empty, and the agent looks unchanged.
+- **claude does NOT strip the environment it hands a statusLine command.**
+  `TERMIC_PTY`, `TERMIC_TASK_ID` and an arbitrary unrelated variable all arrive
+  intact. This is the exact thing that killed the transport for Muse Code, so
+  it was worth checking rather than assuming, and it is why the numbers arrive
+  already attributed to a task with no cwd mapping.
+- **`/dev/tty` fails the same way it does for a hook** (`Device not
+  configured`). The three-target chain is load-bearing here too, not
+  defensive.
+
+**It runs about once per TURN, not several times per second.** Measured on
+2.1.260 with an instrumented script counting its own invocations: 5 runs across
+4 turns, and 2 runs across a single 60s streaming turn (one of them before the
+prompt was even submitted). Worth stating because the opposite is a plausible
+guess and Orca's own source comments claim their statusline "ticks ~3x/sec
+while streaming", which would have made a spawn-per-tick script a real
+regression and forced a throttle. It does not, on this version, so there is no
+throttle here. If a future release changes that, this is the measurement to
+redo before anything else.
+
+One invocation costs ~12ms wall / ~11.5ms CPU, of which ~9ms is the bare
+`/bin/sh` spawn and drain: the parsing itself is ~2.5ms. Against a turn
+measured in seconds, per turn, that is not a number worth optimising.
+
+**The slot is not termic's.** A config has exactly one `statusLine`, and a user
+who wrote their own looks at it on every turn. `merge_statusline` claims it only
+when it is free or already ours, decided by the command's path prefix, the same
+ownership test the hook entries use. A slot taken by anyone else is left exactly
+as it is and that user simply gets no usage. The script is still WRITTEN in that
+case, so clearing their own status line later turns the feature on at the next
+sync without a reinstall. Docker is unaffected: termic owns that config dir
+outright, so there is no slot to lose.
+
+**A PROJECT-level status line silently wins, and there is nothing to do about
+it.** Claude Code reads `.claude/settings.json` inside the repo as well as the
+user's own, and the project one outranks it. Measured with termic's real
+installed status line at user level and a marker one in a project's
+`.claude/settings.json`: the project's marker rendered in the TUI and termic's
+usage OSC never fired at all.
+
+So a repo that ships its own status line gets no usage chip for its tasks,
+while every other project on the same account still does. That is confusing and
+it is still the right behaviour: the alternative is writing termic's absolute
+path into a file that lives IN THE USER'S REPOSITORY and gets committed, which
+is not a trade any footer is worth. The same is true of
+`.claude/settings.local.json`.
+
+The honest gap is that termic does not currently NOTICE. Detecting it means
+reading the task's repo settings per task rather than per agent, and saying so
+somewhere the user will look; worth doing if this feature ships, and tracked in
+docs/ideas/usage-footer.md rather than pretended away here.
+
+Sources that are NOT this, all measured and all dead: claude's HOOK payloads
+carry no usage field (a real `Stop` payload has `session_id`,
+`transcript_path`, `cwd`, `prompt_id`, `permission_mode`, `effort`,
+`background_tasks`, `session_crons`, and nothing else); its transcript JSONL
+writes `quotaLimits` ONLY on a request that was already rejected; and its OTEL
+export has no rate-limit metric. codex is the other way round entirely: it has
+no status line and is ASKED, over `account/rateLimits/read` (docs/ipc.md).
+docs/ideas/usage-footer.md carries that whole comparison, including the OAuth
+endpoint and why the keychain makes it the wrong default on a Mac host.
+
 ## Cloned agents
 
 Everything here resolves through `extends`: the event set, the schema, the

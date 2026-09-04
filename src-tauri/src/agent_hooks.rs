@@ -64,12 +64,19 @@ use std::path::{Path, PathBuf};
 // reports the session id, which is the only way a repo-root codex task can
 // resume its OWN conversation instead of whichever one ran last in that
 // directory.
+// v7 adds claude's usage STATUS LINE (GH #277), which is not a hook and is not
+// in `hooks_for`: it is a second file in the same script dir plus a `statusLine`
+// entry in the same config. A v6 install has neither, and nothing but a
+// reinstall would write them, so the bump is the only thing that gets the
+// footer its numbers on an existing setup. Unlike every bump above this one is
+// stale-and-quieter rather than stale-and-harmful: a v6 install keeps reporting
+// state correctly and shows no usage.
 //
 // Safe to bump for an existing codex install: the trust entries in config.toml
 // hash the hooks.json ENTRY (command path, timeout, status message), none of
 // which this changes, so a reinstall re-asks codex and writes back the same
 // hashes rather than orphaning them.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Directory we create inside the agent's config dir. Also the prefix that
 /// identifies our entries for removal, which is why it must never be renamed
@@ -197,6 +204,140 @@ const SESSION_BODY_PREFIX: &str = "session ";
 /// a prefix of `ATTENTION_BODY` or vice versa: the TS handler routes the two
 /// apart on an exact match and would badge a ready session as needing you.
 const READY_BODY: &str = "agent ready for input";
+
+/// Prefix of the body that reports subscription usage (GH #277). Written by the
+/// STATUS LINE, not by a hook, but it rides the same OSC 777 channel and the
+/// same trusted `termic` title. Must never be a prefix of `ATTENTION_BODY` or
+/// `READY_BODY`, or vice versa: the TS handler tells the three apart on the
+/// body alone. KEEP IN SYNC with `USAGE_BODY_PREFIX` in `lib/agentUsage.ts`.
+const USAGE_BODY_PREFIX: &str = "usage ";
+
+/// Filename stem of the status line script. Not a `Signal::stem()`, because a
+/// status line is not a signal: it is not registered against an event, it is
+/// not part of `hooks_for`, and `installed` must not depend on it.
+const USAGE_STEM: &str = "usage";
+
+/// The claude status line, which is how termic learns subscription usage
+/// without asking Anthropic for it (GH #277).
+///
+/// Claude Code pipes `rate_limits` into the statusLine command's stdin on every
+/// turn, piggybacked on the Messages API response, so reading it costs no
+/// request and no rate-limit budget of its own. The alternative was the OAuth
+/// usage endpoint, which on a Mac host needs a keychain item whose ACL names
+/// only `/usr/bin/security`; see docs/ideas/usage-footer.md for that whole
+/// comparison.
+///
+/// **This script must print NOTHING.** Whatever a status line writes to stdout
+/// is rendered by claude under the user's input box on every turn. Measured
+/// both ways on 2.1.260: a probe printing a marker put the marker on screen, a
+/// probe printing an empty string left no text at all. So the numbers go out
+/// the side channel the hooks already use, and the slot stays visually empty.
+///
+/// Deliberately no `jq`, like every other script here: it keeps the "no
+/// dependencies" property, and a status line that fails to run is one claude
+/// reports on every single turn.
+pub fn statusline_body() -> String {
+    STATUSLINE_TEMPLATE
+        .replace("@NOTIFY@", NOTIFY_PREFIX)
+        .replace("@USAGE@", USAGE_BODY_PREFIX)
+        .replace("@SCHEMA@", &SCHEMA_VERSION.to_string())
+}
+
+/// Written as a template with `@TOKEN@` holes rather than a `format!`, because
+/// the body is mostly `${...}` parameter expansion and every brace in it would
+/// otherwise have to be doubled. A shell script full of `{{` is a script nobody
+/// can read against the thing it is supposed to be.
+const STATUSLINE_TEMPLATE: &str = r#"#!/bin/sh
+# termic status line for claude (usage feed, schema v@SCHEMA@). Safe to delete.
+#
+# Reports subscription usage to termic by writing ONE OSC sequence to the
+# terminal termic handed it, and printing NOTHING to stdout.
+#
+# Printing nothing is the point. Claude renders a status line's stdout under
+# the user's input box on every turn, so anything printed here would be a
+# termic string sitting in the user's agent forever. The numbers ride the same
+# side channel the termic hooks use instead.
+#
+# No network, no files, no arguments, no dependencies. Exits 0 on every path:
+# a status line must never be why an agent stalls, and claude runs this one
+# every turn.
+
+# Drain stdin FIRST, whatever happens next. An early exit that left the payload
+# unread is a broken pipe on claude's side, once per turn.
+payload=$(cat | tr -d '[:space:]')
+
+# Installed globally, so this also runs in iTerm, Ghostty and CI. An empty
+# status line is the correct output there, and it is what an exit prints.
+[ -n "$TERMIC_TASK_ID" ] || exit 0
+[ -n "$TERMIC_PTY" ] || exit 0
+# grok reads ~/.claude/settings.json too, so this file can also run under grok.
+# The user never opted grok in here. Same provenance rule as its hook siblings.
+[ -z "$GROK_HOOK_EVENT" ] || exit 0
+
+case "$payload" in
+  *'"rate_limits":'*) ;;
+  *) exit 0 ;;
+esac
+rl=${payload#*'"rate_limits":'}
+
+# One window object sliced out, then one number read out of it.
+#
+# A field is cut at the next ',' and then at the next '}', so it parses whether
+# or not it is last in its object. TWO cuts rather than one '[,}]' class: a '}'
+# inside a bracket expression closes the ${...} itself, so that pattern silently
+# leaves ']*}' glued to every value. Traced, not guessed.
+#
+# A value that is not bare digits is dropped rather than passed on: the body it
+# would land in is a ';'-separated OSC payload.
+five='-'; fivereset='-'; seven='-'; sevenreset='-'
+
+case "$rl" in
+  *'"five_hour":{'*)
+    w=${rl#*'"five_hour":{'}
+    w=${w%%\}*}
+    case "$w" in
+      *'"used_percentage":'*)
+        v=${w#*'"used_percentage":'}; v=${v%%,*}; v=${v%%\}*}
+        case "$v" in ''|*[!0-9.]*) ;; *) five=$v ;; esac ;;
+    esac
+    case "$w" in
+      *'"resets_at":'*)
+        v=${w#*'"resets_at":'}; v=${v%%,*}; v=${v%%\}*}
+        case "$v" in ''|*[!0-9]*) ;; *) fivereset=$v ;; esac ;;
+    esac
+    ;;
+esac
+
+case "$rl" in
+  *'"seven_day":{'*)
+    w=${rl#*'"seven_day":{'}
+    w=${w%%\}*}
+    case "$w" in
+      *'"used_percentage":'*)
+        v=${w#*'"used_percentage":'}; v=${v%%,*}; v=${v%%\}*}
+        case "$v" in ''|*[!0-9.]*) ;; *) seven=$v ;; esac ;;
+    esac
+    case "$w" in
+      *'"resets_at":'*)
+        v=${w#*'"resets_at":'}; v=${v%%,*}; v=${v%%\}*}
+        case "$v" in ''|*[!0-9]*) ;; *) sevenreset=$v ;; esac ;;
+    esac
+    ;;
+esac
+
+# Nothing readable in the payload: say nothing rather than report two dashes.
+[ "$five" = '-' ] && [ "$seven" = '-' ] && exit 0
+
+# THREE targets, tried in order, exactly as the hooks do: $TERMIC_PTY is a HOST
+# path a Docker-sandboxed agent cannot see, /proc/1/fd/1 is the container's own
+# stdout which docker relays to that same pty, /dev/tty is the last resort that
+# usually fails because these run with no controlling terminal.
+#
+# The values go through printf's %s, never into its FORMAT string.
+emit() { printf ']@NOTIFY@@USAGE@%s %s %s %s' "$five" "$seven" "$fivereset" "$sevenreset" > "$1" 2>/dev/null; }
+emit "$TERMIC_PTY" || emit /proc/1/fd/1 || emit /dev/tty || true
+exit 0
+"#;
 
 impl Signal {
     /// The OSC payload, without introducer or terminator.
@@ -1238,6 +1379,50 @@ fn command_for(target: &Target, sig: Signal) -> Result<String, String> {
     Ok(format!("{}{}.sh", command_prefix(target)?, sig.stem()))
 }
 
+/// Claim claude's `statusLine`, but ONLY when it is free or already ours.
+///
+/// There is exactly one such slot per config, and it is not termic's. A user
+/// who has written their own status line looks at it on every turn, and
+/// silently replacing it would be the most visible thing this feature could
+/// possibly do. So a slot that is taken by anyone else is left exactly as it
+/// is, and the usage feed simply does not arrive for that user.
+///
+/// Ownership is decided by the command's PATH PREFIX, the same test the hook
+/// entries use, rather than by a marker key: it survives the user reformatting
+/// the config, and claude's schema has nowhere to put a marker anyway.
+fn merge_statusline(root: &Value, command: &str, prefix: &str) -> Value {
+    let mut out = root.clone();
+    let Some(obj) = out.as_object_mut() else { return out };
+    let ours = match obj.get("statusLine") {
+        None => true,
+        Some(v) => v
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|c| c.starts_with(prefix)),
+    };
+    if !ours {
+        return out;
+    }
+    obj.insert(
+        "statusLine".into(),
+        serde_json::json!({ "type": "command", "command": command }),
+    );
+    out
+}
+
+/// The inverse: drop the slot if it still names one of our scripts, else leave
+/// it. Returns None when there was nothing of ours to remove, so the caller can
+/// tell "removed" from "untouched" and skip a pointless rewrite of the file.
+fn unmerge_statusline(root: &Value, prefix: &str) -> Option<Value> {
+    let cmd = root.get("statusLine")?.get("command")?.as_str()?;
+    if !cmd.starts_with(prefix) {
+        return None;
+    }
+    let mut out = root.clone();
+    out.as_object_mut()?.remove("statusLine");
+    Some(out)
+}
+
 pub fn install(target: &Target) -> Result<(), String> {
     // The BASE: what this agent behaves as. Paths still come from the target,
     // which carries the instance id, so a clone writes into its own config dir.
@@ -1325,6 +1510,25 @@ pub fn install(target: &Target) -> Result<(), String> {
             for (event, command, sig) in &commands {
                 acc = merge(&acc, command, &prefix, event, sig.status_message());
             }
+            // The usage status line (GH #277). claude ONLY: it is the one agent
+            // that pipes rate limits into a statusLine command, and grok, which
+            // shares this schema, has no such slot to write into.
+            //
+            // Written unconditionally, merged conditionally. The script is
+            // cheap and harmless to have on disk, and writing it even when the
+            // slot is taken means a user who later clears their own status line
+            // gets the feature on the next sync without a reinstall.
+            if agent == "claude" {
+                let script = dir.join(format!("{USAGE_STEM}.sh"));
+                write_atomic(&script, statusline_body().as_bytes())?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                        .map_err(|e| format!("chmod status line: {e}"))?;
+                }
+                acc = merge_statusline(&acc, &format!("{prefix}{USAGE_STEM}.sh"), &prefix);
+            }
             acc
         }
         Schema::AntigravityNamed => agy_merge(&root, &commands),
@@ -1402,6 +1606,14 @@ pub fn remove(target: &Target) -> Result<(), String> {
                     acc = next;
                     touched = true;
                 }
+            }
+            // Hand the statusLine slot back, but only if it is still ours. A
+            // user who replaced it with their own since the install keeps
+            // theirs: `unmerge_statusline` matches on our command prefix, the
+            // same ownership test the install used to claim it.
+            if let Some(next) = unmerge_statusline(&acc, &prefix) {
+                acc = next;
+                touched = true;
             }
             if touched { Some(acc) } else { None }
         }
@@ -1505,7 +1717,14 @@ pub struct HookPlan {
 #[tauri::command]
 pub fn agent_hooks_plan(agent_id: String) -> Result<HookPlan, String> {
     let target = Target::Host(agent_id.clone());
-    let hooks = hooks_for(&agent_id);
+    // The BASE decides the SHAPE (which events, which schema, which config
+    // file); paths still come from the target, which carries the instance id.
+    // `install` has always resolved it this way, and the preview did not, so a
+    // clone was shown an empty plan and then given a working install. Every
+    // lookup below that asks "what is this agent" takes the base for that
+    // reason. See `docker.rs` on why conflating the two breaks clones.
+    let base = base_of(&agent_id);
+    let hooks = hooks_for(&base);
     let prefix = command_prefix(&target).unwrap_or_default();
     let entries: Vec<HookPlanEntry> = hooks
         .iter()
@@ -1513,11 +1732,11 @@ pub fn agent_hooks_plan(agent_id: String) -> Result<HookPlan, String> {
             event: (*event).to_string(),
             reports: sig.stem().to_string(),
             script_path: format!("{prefix}{}.sh", sig.stem()),
-            script_body: script_body(&agent_id, *sig),
+            script_body: script_body(&base, *sig),
         })
         .collect();
 
-    let shared = settings_rel(&agent_id) == "settings.json";
+    let shared = settings_rel(&base) == "settings.json";
     let fragment = if hooks.is_empty() {
         String::new()
     } else {
@@ -1525,13 +1744,20 @@ pub fn agent_hooks_plan(agent_id: String) -> Result<HookPlan, String> {
             .iter()
             .map(|(e, s)| (*e, format!("{prefix}{}.sh", s.stem()), *s))
             .collect();
-        let merged = match schema_for(&agent_id) {
+        let merged = match schema_for(&base) {
             Schema::AntigravityNamed => agy_merge(&Value::Object(Map::new()), &commands),
             Schema::OpencodePlugin => Value::String("(a JS plugin file, shown below)".into()),
             Schema::ClaudeCompatible => {
                 let mut acc = Value::Object(Map::new());
                 for (event, command, sig) in &commands {
                     acc = merge(&acc, command, &prefix, event, sig.status_message());
+                }
+                // Mirror what `install` actually writes, statusLine included.
+                // A preview that omitted it would show the user a fragment
+                // smaller than the change they are approving, and this is the
+                // one key in that fragment that is not termic's to take.
+                if base == "claude" {
+                    acc = merge_statusline(&acc, &format!("{prefix}{USAGE_STEM}.sh"), &prefix);
                 }
                 acc
             }
@@ -1540,6 +1766,15 @@ pub fn agent_hooks_plan(agent_id: String) -> Result<HookPlan, String> {
     };
 
     let mut notes = Vec::new();
+    if base == "claude" {
+        notes.push(
+            "Also installs a status line that reports how much of your plan \
+             limits you have used, for the task footer. It prints nothing, so \
+             the agent looks unchanged. If you already have your own status \
+             line, yours is kept and no usage is shown."
+                .into(),
+        );
+    }
     if !hooks.is_empty() {
         notes.push(
             "Each script writes one OSC sequence to this terminal and exits 0. \
@@ -2035,13 +2270,238 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
         assert_ne!(Signal::Ready.status_message(), Signal::Attention.status_message());
     }
 
+    // ── The usage status line (GH #277) ────────────────────────────────
+
+    /// Run the generated status line against a payload and return what it put
+    /// on the pty, plus what it printed on STDOUT.
+    ///
+    /// Same harness as `done_emits_for`, and for the same reason: the whole
+    /// thing is shell parameter expansion, and shell is where the bugs are.
+    /// Stdout is captured too because "prints nothing" is a load-bearing
+    /// property here, not a detail: whatever a status line prints, claude
+    /// renders under the user's input box on every turn.
+    #[cfg(unix)]
+    fn statusline_run(payload: &str) -> (String, String) {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+
+        let dir = std::env::temp_dir().join(format!(
+            "termic-statusline-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("usage.sh");
+        let pty = dir.join("pty");
+        std::fs::write(&script, statusline_body()).unwrap();
+        std::fs::write(&pty, "").unwrap();
+
+        let mut child = Command::new("/bin/sh")
+            .arg(&script)
+            .env("TERMIC_TASK_ID", "t1")
+            .env("TERMIC_PTY", &pty)
+            .env_remove("GROK_HOOK_EVENT")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+        {
+            use std::io::Write as _;
+            child.stdin.as_mut().unwrap().write_all(payload.as_bytes()).unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "a status line must never exit non-zero");
+
+        let mut emitted = String::new();
+        std::fs::File::open(&pty).unwrap().read_to_string(&mut emitted).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        (emitted, String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// The shape claude pipes in. Transcribed from the schema rather than
+    /// pasted from a live session (CLAUDE.md on fixtures), with the awkward
+    /// parts kept: `used_percentage` arrives as a float with float noise, and
+    /// `rate_limits` is the LAST key in the object so its window has no
+    /// trailing comma to cut on.
+    #[cfg(unix)]
+    const STATUSLINE_PAYLOAD: &str = r#"{
+      "session_id": "00000000-0000-0000-0000-000000000000",
+      "cwd": "/Users/u/work/repo",
+      "model": { "display_name": "Opus 5" },
+      "context_window": { "used_percentage": 4, "remaining_percentage": 96 },
+      "rate_limits": {
+        "five_hour": { "used_percentage": 16, "resets_at": 1788530400 },
+        "seven_day": { "used_percentage": 14.000000000000002, "resets_at": 1788937200 }
+      }
+    }"#;
+
+    #[test]
+    #[cfg(unix)]
+    fn the_status_line_reports_both_windows_and_prints_nothing() {
+        let (emitted, stdout) = statusline_run(STATUSLINE_PAYLOAD);
+        // Printing NOTHING is the whole reason this slot is usable at all.
+        // Measured on 2.1.260: a status line printing a marker puts the marker
+        // on screen; one printing an empty string leaves no text.
+        assert_eq!(stdout, "", "a status line's stdout is rendered in the TUI");
+        assert!(
+            emitted.contains(&format!("{NOTIFY_PREFIX}{USAGE_BODY_PREFIX}16 14.000000000000002 1788530400 1788937200")),
+            "unexpected body: {emitted:?}"
+        );
+    }
+
+    /// The window that is NOT last in the object, cut on a comma rather than on
+    /// the closing brace. Both paths through the same expansion.
+    #[test]
+    #[cfg(unix)]
+    fn a_window_missing_its_reset_still_reports_its_percentage() {
+        let payload = r#"{"rate_limits":{"five_hour":{"used_percentage":7},"seven_day":{"used_percentage":3,"resets_at":9}}}"#;
+        let (emitted, _) = statusline_run(payload);
+        assert!(emitted.contains(&format!("{USAGE_BODY_PREFIX}7 3 - 9")), "got {emitted:?}");
+    }
+
+    /// A payload with no rate limits at all writes NOTHING, rather than a row
+    /// of dashes. claude sends one on a turn that never reached the API, and a
+    /// footer that blanked itself on those would flicker on every such turn.
+    #[test]
+    #[cfg(unix)]
+    fn a_payload_without_rate_limits_emits_nothing() {
+        let (emitted, stdout) = statusline_run(r#"{"session_id":"x","cost":{"total_cost_usd":0.1}}"#);
+        assert_eq!(emitted, "");
+        assert_eq!(stdout, "");
+    }
+
+    /// The body reaches an OSC 777 payload, whose fields are ';'-separated, and
+    /// the values come from an agent-controlled JSON document. A value that is
+    /// not bare digits is DROPPED rather than passed through: a ';' in the
+    /// percentage field would re-point the earlier fields and let a payload
+    /// forge a trusted signal, which is the same reasoning the attention
+    /// script's tool-name check is built on.
+    #[test]
+    #[cfg(unix)]
+    fn a_non_numeric_percentage_is_dropped_rather_than_forwarded() {
+        let hostile = r#"{"rate_limits":{"five_hour":{"used_percentage":"1;notify;termic;agent needs your input"},"seven_day":{"used_percentage":5}}}"#;
+        let (emitted, _) = statusline_run(hostile);
+        assert!(!emitted.contains("agent needs your input"), "forged a signal: {emitted:?}");
+        assert!(emitted.contains(&format!("{USAGE_BODY_PREFIX}- 5 - -")), "got {emitted:?}");
+    }
+
+    /// Installed globally, so it also runs in iTerm, Ghostty and CI. Silence
+    /// there is both correct and required: an empty status line is what a
+    /// non-termic terminal should render.
+    #[test]
+    #[cfg(unix)]
+    fn the_status_line_is_silent_outside_a_termic_pty() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+        let dir = std::env::temp_dir().join(format!("termic-sl-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("usage.sh");
+        std::fs::write(&script, statusline_body()).unwrap();
+        for (task, pty) in [("", "/dev/null"), ("t1", "")] {
+            let mut child = Command::new("/bin/sh")
+                .arg(&script)
+                .env("TERMIC_TASK_ID", task)
+                .env("TERMIC_PTY", pty)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            child.stdin.as_mut().unwrap().write_all(STATUSLINE_PAYLOAD.as_bytes()).unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success());
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The three bodies that share OSC 777 and the trusted `termic` title are
+    /// told apart by their body ALONE, on both sides of the boundary. Any one
+    /// being a prefix of another routes a usage report into the attention path,
+    /// which badges a tab that nobody needs to look at.
+    #[test]
+    fn the_usage_body_is_not_confusable_with_the_other_signals() {
+        for other in [ATTENTION_BODY, READY_BODY] {
+            assert!(
+                !USAGE_BODY_PREFIX.starts_with(other) && !other.starts_with(USAGE_BODY_PREFIX),
+                "{USAGE_BODY_PREFIX:?} vs {other:?} are confusable"
+            );
+        }
+        // Pinned against USAGE_BODY_PREFIX in lib/agentUsage.ts, which cannot
+        // import this. The two are the halves of one contract.
+        assert_eq!(USAGE_BODY_PREFIX, "usage ");
+        // Not a Signal stem: a status line is not registered against an event,
+        // so `installed` must never depend on it.
+        for sig in [Signal::Attention, Signal::Working, Signal::Done, Signal::Ready] {
+            assert_ne!(sig.stem(), USAGE_STEM);
+        }
+    }
+
+    #[test]
+    fn the_status_line_claims_an_empty_slot_and_never_a_users_own() {
+        let prefix = "/home/u/.claude/termic-hooks/";
+        let cmd = format!("{prefix}usage.sh");
+
+        // Empty config: ours goes in.
+        let claimed = merge_statusline(&serde_json::json!({}), &cmd, prefix);
+        assert_eq!(claimed["statusLine"]["command"], serde_json::json!(cmd));
+        assert_eq!(claimed["statusLine"]["type"], serde_json::json!("command"));
+
+        // A user's own status line is the one thing they look at every turn.
+        // Replacing it would be the most visible thing this feature could do.
+        let theirs = serde_json::json!({
+            "statusLine": { "type": "command", "command": "/home/u/bin/my-bar.sh" }
+        });
+        assert_eq!(merge_statusline(&theirs, &cmd, prefix), theirs, "clobbered the user's status line");
+        assert_eq!(unmerge_statusline(&theirs, prefix), None, "removal must not take the user's");
+
+        // Ours, re-installed: idempotent, not duplicated.
+        let again = merge_statusline(&claimed, &cmd, prefix);
+        assert_eq!(again, claimed);
+
+        // Removal hands the slot back, and reports that it did so.
+        let stripped = unmerge_statusline(&claimed, prefix).expect("ours should be removable");
+        assert!(stripped.get("statusLine").is_none());
+        assert_eq!(unmerge_statusline(&serde_json::json!({}), prefix), None);
+    }
+
+    /// Other keys in the config are the user's, and a merge that reordered or
+    /// dropped them would be a silent rewrite of a file they hand-wrote.
+    #[test]
+    fn claiming_the_slot_leaves_the_rest_of_the_config_alone() {
+        let prefix = "/home/u/.claude/termic-hooks/";
+        let root = serde_json::json!({ "theme": "dark", "hooks": { "Stop": [] } });
+        let out = merge_statusline(&root, &format!("{prefix}usage.sh"), prefix);
+        assert_eq!(out["theme"], serde_json::json!("dark"));
+        assert_eq!(out["hooks"], root["hooks"]);
+    }
+
+    /// A clone must be PREVIEWED as what it will actually get. `install`
+    /// resolves the base and the preview did not, so a clone of claude was
+    /// shown an empty plan and then handed a full install: the dialog
+    /// disagreed with the thing it was asking permission for.
+    #[test]
+    fn the_install_preview_resolves_a_clone_to_its_base() {
+        let plan = agent_hooks_plan("claude".into()).expect("claude has a plan");
+        assert!(!plan.entries.is_empty());
+        assert!(
+            plan.config_fragment.contains("statusLine"),
+            "the preview must show every key the install writes: {}",
+            plan.config_fragment
+        );
+        // A note has to SAY the status line is part of this, since the slot is
+        // the one thing in that fragment that is not termic's to take.
+        assert!(plan.notes.iter().any(|n| n.contains("status line")));
+    }
+
     #[test]
     fn the_schema_bump_is_what_makes_sync_replace_old_installs() {
         // The upgrade path rests entirely on this. An install from the build
         // before the current set must read as stale, or `agent_hooks_sync`
         // skips it and the user keeps that set forever: v3 types into startup
         // dialogs, v4 holds a tab on `working` for the rest of the session.
-        assert_eq!(SCHEMA_VERSION, 6, "bump me with the hook set, or installs go stale silently");
+        assert_eq!(SCHEMA_VERSION, 7, "bump me with the hook set, or installs go stale silently");
     }
 
     #[test]
