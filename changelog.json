@@ -1,6 +1,11 @@
 {
   "versions": [
     {
+      "version": "1.2.0",
+      "date": "2026-09-04",
+      "summary": "Muse Code joins the built-in agents, and Codex now reports its own state."
+    },
+    {
       "version": "1.1.2",
       "date": "2026-09-03",
       "summary": "Agents now tell Termic what they are doing, instead of Termic guessing from the terminal."

@@ -4,6 +4,43 @@ All notable changes to Termic, newest first. This file is the human-authored
 source of truth: the in-app Update card and the /changelog page on termic.dev
 are generated from it. See the `release` skill for how entries are added.
 
+## [1.2.0] - 2026-09-04
+
+Muse Code joins the built-in agents, and Codex now reports its own state.
+
+### Features
+- **Muse Code**, Meta's terminal agent, ships as a built-in: launch it, YOLO
+  it, sandbox it and resume it like any other CLI.
+  ([#275](https://github.com/simion/termic/issues/275))
+- **Codex reports its own state** through agent hooks, so ready, working,
+  needs-you and done come from Codex rather than from Termic reading its
+  terminal. Turn them on in Settings, Agents.
+- **Codex resumes the right conversation in a main checkout.** Several tasks
+  in one repo root used to share whichever session ran last there; each task
+  now returns to its own.
+
+### Bug fixes
+- One turn interrupts you once. A long turn could raise a desktop notification
+  at every stage boundary, so an agent working for ten minutes could ring
+  repeatedly. The badge still tracks each stage; only the notification is
+  deduplicated. ([#276](https://github.com/simion/termic/issues/276))
+- Claude's needs-you notification names the tool it is blocked on ("needs your
+  permission: Bash") instead of "agent needs your input".
+- The toolbar's sandbox icon now matches the sidebar, the footer and the mode
+  picker for monitoring mode.
+- Settings no longer calls your Docker sandbox Dockerfile "customised" just
+  because Termic shipped a new default one. It now remembers which default your
+  file came from, so an untouched Dockerfile picks up new agents on its own and
+  an edited one is left alone.
+
+### Heads-up
+- **Your Docker sandbox Dockerfile is reset to the shipped default once, on
+  first launch of this version, even if you edited it.** This release is where
+  Termic starts remembering which default your file came from, and profiles
+  from before it carry no such record, so there is no way to tell a real edit
+  from an older Termic's copy. Save anything you want to keep before updating.
+  From this release on, your edits survive.
+
 ## [1.1.2] - 2026-09-03
 
 Agents now tell Termic what they are doing, instead of Termic guessing from the terminal.
