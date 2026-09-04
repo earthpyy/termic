@@ -428,9 +428,16 @@ function StepHooks({ clis }: { clis: CliInfo[] }) {
                 <span className="text-[13px]">{CLI_LABEL[id] ?? id}</span>
               </div>
               <div className="flex items-center gap-2">
+                {/* codex used to be special-cased here to "not needed", on the
+                    grounds that its title already reports a permission prompt.
+                    It does, and that was never the state that broke: an agent
+                    with no hooks can never stand the heuristics down, so every
+                    turn it runs ends in a guess (GH #276). It is wired now, so
+                    the special case is gone and every unsupported agent reads
+                    the same. */}
                 <span className="text-[11.5px] text-[var(--color-fg-dim)]">
                   {!st ? "checking…"
-                    : !st.supported ? (id === "codex" ? "not needed" : "not supported yet")
+                    : !st.supported ? "not supported yet"
                     : st.host.disabled_all ? "hooks are disabled in this config"
                     : st.host.installed ? "on" : "off"}
                 </span>

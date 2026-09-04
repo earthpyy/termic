@@ -34,6 +34,37 @@ export const HOOK_OSC_BODY = "agent needs your input";
  *  and types into it. KEEP IN SYNC with `Signal::Ready`'s payload in Rust. */
 export const HOOK_OSC_READY_BODY = "agent ready for input";
 
+/** Prefix of the body that reports the agent's OWN session id, so termic can
+ *  resume that exact session later.
+ *
+ *  It exists for codex, which is the one agent that can resume a session by id
+ *  but cannot be TOLD an id at launch: its TUI has no `--session-id`, and
+ *  `codex resume <fresh-uuid>` errors ("no rollout found for thread id") rather
+ *  than minting like pi's does. So the id has to come back FROM the agent, and
+ *  its `SessionStart` payload carries one at the earliest possible moment.
+ *
+ *  Delivered as a second OSC from the same hook rather than folded into the
+ *  ready body, because ready is routed on an EXACT match and that is
+ *  load-bearing (see `HOOK_OSC_READY_BODY`). A prefix match here, an exact
+ *  match there, and neither can be mistaken for the other.
+ *
+ *  KEEP IN SYNC with `SESSION_BODY_PREFIX` in `agent_hooks.rs`. */
+export const HOOK_OSC_SESSION_PREFIX = "session ";
+
+/** The session id in a trusted `session <uuid>` body, or null.
+ *
+ *  Validated as a UUID rather than taken verbatim, and that is not politeness:
+ *  the value is stored on the tab and later expanded into `resume {UUID}` on a
+ *  COMMAND LINE. A body is an agent-controlled string; anything that is not
+ *  plainly an id is dropped. */
+export function hookOscSessionId(body: string): string | null {
+  if (!body.startsWith(HOOK_OSC_SESSION_PREFIX)) return null;
+  const id = body.slice(HOOK_OSC_SESSION_PREFIX.length).trim();
+  return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(id)
+    ? id
+    : null;
+}
+
 /** The OSC payload without its introducer or terminator: what you would put
  *  between `ESC ]` and `BEL`. Control characters are never written as raw bytes
  *  in this file, only as escapes, so the source stays greppable and a stray

@@ -21,7 +21,7 @@ vi.mock("@/lib/utils", () => ({
   slugify: (s: string) => s.toLowerCase().replace(/\s+/g, "-"),
 }));
 
-import { spawnArgsForCli, defaultCliFirst, visibleCliIds, cliSupportsIdSession, cliSupportsResumeById, agentDisplayName, decideResume, isTerminalCli, workDoneCapable, terminalLaunchCommand, classifyAgentTitle, compileSignals, BUILTIN_TITLE_SIGNALS, BUILTIN_OUTPUT_SIGNALS, builtinBaseId, YOLO_ARGS_NOTES, resolveAgent, agentOverrides, hasPendingWork, notificationWantsAttention, PENDING_TAIL_ROWS } from "@/lib/agents";
+import { resumeIdArgsForCli, cliSupportsCaptureResume, spawnArgsForCli, defaultCliFirst, visibleCliIds, cliSupportsIdSession, cliSupportsResumeById, agentDisplayName, decideResume, isTerminalCli, workDoneCapable, terminalLaunchCommand, classifyAgentTitle, compileSignals, BUILTIN_TITLE_SIGNALS, BUILTIN_OUTPUT_SIGNALS, builtinBaseId, YOLO_ARGS_NOTES, resolveAgent, agentOverrides, hasPendingWork, notificationWantsAttention, PENDING_TAIL_ROWS } from "@/lib/agents";
 import type { Agent, CliInfo } from "@/lib/types";
 
 // ── spawnArgsForCli ───────────────────────────────────────────────────
@@ -323,6 +323,47 @@ describe("pi resume", () => {
   });
 });
 
+// Repo-root resume for codex. Several tasks share one cwd there, so
+// `resume --last` hands the second task the first one's conversation; that is
+// what the id-based path exists to stop.
+//
+// codex is the CAPTURE shape, not the mint shape, and the difference is
+// measured rather than assumed: its TUI has no `--session-id`, and
+// `codex resume <fresh-uuid>` answers "no rollout found for thread id" instead
+// of creating it the way pi's flag does. The id therefore has to come back FROM
+// the agent, which it does over termic's own SessionStart hook.
+describe("codex resume", () => {
+  beforeEach(() => { mockAgents.length = 0; });
+  const args = (o: Parameters<typeof spawnArgsForCli>[1]) => spawnArgsForCli("codex", o);
+
+  it("is capture-capable, not mint-capable", () => {
+    expect(cliSupportsIdSession("codex")).toBe(false);
+    expect(cliSupportsCaptureResume("codex")).toBe(true);
+    expect(cliSupportsResumeById("codex")).toBe(true);
+  });
+
+  it("still resumes by cwd for a worktree, where that is the right answer", () => {
+    expect(args({ yolo: false, resume: true })).toEqual(["resume", "--last"]);
+  });
+
+  it("resumes a SPECIFIC session once one has been reported", () => {
+    expect(resumeIdArgsForCli("codex", "01a06adc-eeb5-77a0-b603-d7b670dd11e7"))
+      .toEqual(["resume", "01a06adc-eeb5-77a0-b603-d7b670dd11e7"]);
+  });
+
+  it("never passes a uuid at MINT time, because codex would reject it", () => {
+    // `resume <unknown-uuid>` exits with "no rollout found for thread id", so a
+    // spawn that invented one would fail every time instead of starting fresh.
+    expect(args({ yolo: false, resume: false, sessionUuid: "u-1", resumeKnown: false }))
+      .toEqual([]);
+  });
+
+  it("composes with yolo in the order codex accepts", () => {
+    expect(args({ yolo: true, resume: true }))
+      .toEqual(["resume", "--last", "--dangerously-bypass-approvals-and-sandbox"]);
+  });
+});
+
 // ── defaultCliFirst ───────────────────────────────────────────────────
 
 describe("defaultCliFirst", () => {
@@ -514,8 +555,17 @@ describe("cliSupportsResumeById", () => {
     expect(cliSupportsIdSession("opencode")).toBe(false);
   });
 
-  it("codex is cwd-resume only", () => {
-    expect(cliSupportsResumeById("codex")).toBe(false);
+  it("codex resumes by id, but cannot be handed one at launch", () => {
+    // This used to assert codex was cwd-resume ONLY, which was true until its
+    // repo-root case was fixed: several tasks share the repo root's cwd, so
+    // `resume --last` there is another task's conversation.
+    //
+    // It is still not MINT-capable, and that half is the measured one:
+    // codex's TUI has no `--session-id`, and `codex resume <fresh-uuid>` answers
+    // "no rollout found for thread id" rather than creating it. So it resumes a
+    // specific session only once the agent has reported which one it is.
+    expect(cliSupportsResumeById("codex")).toBe(true);
+    expect(cliSupportsIdSession("codex")).toBe(false);
   });
 
   it("a registry entry gains the capability by declaring resume_id_args", () => {

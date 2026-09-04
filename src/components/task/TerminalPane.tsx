@@ -33,7 +33,7 @@ import { loadTerminalRenderer, awaitTerminalFonts } from "@/lib/terminalRenderer
 import { resyncViewportAfterReveal } from "@/lib/xtermViewportSync";
 import { IS_MAC, bindingMatches, type ShortcutId } from "@/lib/shortcuts";
 import { registerTerminalDropTarget } from "@/lib/terminalDrop";
-import { HOOK_OSC_TITLE, HOOK_OSC_READY_BODY } from "@/lib/agentHooks";
+import { HOOK_OSC_TITLE, HOOK_OSC_READY_BODY, hookOscSessionId } from "@/lib/agentHooks";
 import { imageFromClipboard, pastePathText } from "@/lib/clipboardImage";
 import { setupImeReplacementBridge } from "@/lib/ime";
 import { deliverMessage, sendMessageToPty } from "@/lib/agentSend";
@@ -1773,6 +1773,33 @@ const captureArmedRef = useRef(false);
         if (!agentReadyPatchedRef.current) {
           agentReadyPatchedRef.current = true;
           patchTab(task.id, tab.id, { agentReadyAt: Date.now() });
+        }
+        return false;
+      }
+      // The agent reporting the id of the session it is running, so termic can
+      // resume THAT session later rather than "whatever ran last in this
+      // directory". codex only, today (lib/agentHooks.ts explains why it is the
+      // one agent that needs it).
+      //
+      // Routed BEFORE notifyAttention, and that ordering is load-bearing: a
+      // trusted body skips every notification filter by design, so an
+      // unrecognised one falls straight through to a needs-you badge. Reporting
+      // a session id would otherwise ring a bell on every session start, which
+      // is the exact bug codex's own OSC 9 had just been fixed for.
+      const reported = trusted ? hookOscSessionId(body) : null;
+      if (reported) {
+        wdlog("OSC 777 session id (termic hook)", reported);
+        dbg("osc777-session", reported);
+        // Bail on an unchanged value. This lands once per spawn today, but it
+        // is an agent-controlled path and `setTabSessionId` rewrites the tabs
+        // record AND the tasks record on every call, which is the fanout trap
+        // docs/performance.md bear trap 8 is about.
+        const live = useApp.getState().tabs[task.id]
+          ?.find(t => t.id === tab.id) as TerminalTab | undefined;
+        if (live?.sessionId !== reported) {
+          logWorkState("session-reported",
+            `cli=${tab.cli} task=${JSON.stringify(task.name)} id=${reported}`);
+          useApp.getState().setTabSessionId(task.id, tab.id, reported);
         }
         return false;
       }

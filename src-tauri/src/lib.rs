@@ -33,6 +33,7 @@ use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
 pub mod agent_hooks;
+pub mod codex_trust;
 mod sandbox;
 mod proxy;
 mod repo_config;
@@ -2964,7 +2965,7 @@ fn pty_attached(state: State<'_, PtyManager>, id: String) {
 /// The lock is held across the call and the copy, which is the whole critical
 /// section.
 #[cfg(unix)]
-fn pty_slave_path(master: &Box<dyn portable_pty::MasterPty + Send>) -> Option<String> {
+pub(crate) fn pty_slave_path(master: &Box<dyn portable_pty::MasterPty + Send>) -> Option<String> {
     use std::os::unix::io::RawFd;
     static PTSNAME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let fd: RawFd = master.as_raw_fd()?;
@@ -16192,8 +16193,22 @@ fn default_agents() -> Vec<Agent> {
                 // (most-recent session in CWD). Composes correctly with
                 // global flags placed before: `codex --yolo resume --last`.
                 resume_args: vec!["resume".into(), "--last".into()],
+                // No mint: codex's TUI has no `--session-id`, and
+                // `codex resume <fresh-uuid>` errors ("no rollout found for
+                // thread id") rather than creating it the way pi's flag does.
+                // Verified on 0.153.0.
                 session_id_args: vec![],
-                resume_id_args: vec![],
+                // ...but it CAN resume a specific session, and that is what a
+                // repo-root task needs: several tasks share one cwd, so
+                // `resume --last` hands the second one the first one's
+                // conversation. The id comes back FROM the agent, over
+                // termic's own SessionStart hook (agent_hooks.rs), which is
+                // the same shape opencode uses with its post-launch capture.
+                // Verified end to end on a live 0.153.0: resume by uuid
+                // carries the conversation (asked it to remember a word, a
+                // later resume answered with it), and the id is STABLE across
+                // resumes, so storing it once is enough.
+                resume_id_args: vec!["resume".into(), "{UUID}".into()],
                 name_args: vec![],
                 signals: AgentSignals::default(),
                 match_output: false,

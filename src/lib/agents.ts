@@ -147,7 +147,17 @@ const BUILTIN_FALLBACK: Record<string, Pick<Agent, "command" | "args" | "post_la
       yolo_args: ["--dangerously-bypass-approvals-and-sandbox"],
       runtime_yolo_command: "",
       // `codex resume --last` — subcommand form, picks most-recent session.
+      // Right for a worktree (its cwd is its own), wrong for the repo root,
+      // where several tasks share one cwd and "most recent" is somebody
+      // else's conversation.
       resume_args: ["resume", "--last"],
+      // So repo-root tasks resume by id instead. There is no `session_id_args`
+      // pair because codex cannot be TOLD an id at launch (no `--session-id` on
+      // the TUI; `resume <fresh-uuid>` errors rather than minting), which makes
+      // this the capture shape opencode uses: `cliSupportsCaptureResume` is
+      // true, and the id arrives from termic's own SessionStart hook rather
+      // than from a post-exit shell command.
+      resume_id_args: ["resume", "{UUID}"],
     },
   },
   agy: {

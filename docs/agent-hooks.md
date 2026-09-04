@@ -37,6 +37,7 @@ target.
 | grok | not measured | `UserPromptSubmit`, `PreToolUse` | `Notification` | `Stop` + `StopCancelled` | `StopCancelled` |
 | agy | not measured | `PreInvocation` | none exists (see below) | `Stop`, guarded on `fullyIdle` | none exists |
 | opencode | not measured | `chat.message`, `permission.replied` | `permission.asked` | `session.idle` | `session.idle`, on the SECOND escape |
+| codex | `SessionStart` | `UserPromptSubmit`, `PreToolUse` | `PermissionRequest` | `Stop` | none exists |
 
 **Ready is the only signal that is not a correction.** Everything else here
 replaces a state the terminal reports WRONG. Ready reports one the terminal
@@ -79,8 +80,9 @@ whose hooks are not installed. The queue does NOT use it: a queued message is
 only ever sent after a turn ended, which already proves the agent was at its
 input box.
 
-Codex is deliberately excluded: its title already says `Action Required` at
-+22ms, so it stays on the fallback path.
+Codex is excluded from the ECHO fallback specifically, and only that: its title
+already says `Action Required` at +22ms, so a first message typed into it does
+not need the echo check. It is a full hooks agent otherwise (see below).
 
 **`PreToolUse` is a heartbeat, not a duplicate.** Working is the only sustained
 state here; every other signal is an edge. The title re-asserted working on
@@ -148,6 +150,113 @@ Enter clears the mark, so the state test stayed true long after the user had
 dealt with the prompt and went silent on the NEXT genuine needs-you. A re-ask
 inside the window can only happen with the user at the keyboard, where the focus
 gate suppresses the banner anyway.
+
+## codex hooks do not run until they are TRUSTED
+
+Codex was left out of this feature at first, on the grounds that it "does not
+need it": its title reports `Action Required` at +22ms, so attention was already
+covered. That argument was about the wrong state. An agent with no hooks can
+never reach the `hooksOwn` branch, so every turn it runs is ended by a guess,
+and the byte-quiet fallback calls a turn done after 4s of silence. Four seconds
+of silence is an ordinary model round-trip. That is GH #276, and codex is the
+agent it was reported on.
+
+The event names are claude's, exactly. Codex 0.153.0 reads a claude-shaped
+`hooks.json` and its own `HookEventName` enum carries the same set, so the
+mapping and the `Schema::ClaudeCompatible` merge are reused unchanged. The file
+is `$CODEX_HOME/hooks.json` (flat, NOT `hooks/hooks.json`), confirmed by codex
+reporting a hook written there with `source: "user"`.
+
+**What is new is trust, and it fails silently.** Codex discovers the file,
+reports every hook in it as `enabled: true`, and then does not run them.
+Measured, all four states:
+
+| config | `trustStatus` | runs? |
+| --- | --- | --- |
+| `hooks.json` alone | `untrusted` | no |
+| plus `enabled = true` | `untrusted` | no |
+| plus a WRONG `trusted_hash` | `modified` | no |
+| plus the right `trusted_hash` | `trusted` | **yes** |
+
+There is no error, no log line and no output in any of the three failing rows.
+An install that stopped after writing `hooks.json` would look exactly like a
+working one and report nothing, forever. So installing codex hooks writes two
+files: the hooks, and a trust entry per hook in `$CODEX_HOME/config.toml`.
+
+```toml
+[hooks.state."/Users/u/.codex/hooks.json:session_start:0:0"]
+enabled = true
+trusted_hash = "sha256:…"
+```
+
+The key is `<sourcePath>:<snake_case_event>:<group>:<handler>`.
+
+**The hash is asked for, never computed.** It is not the sha256 of the command,
+the handler object or the file (all three checked, plus six TOML shapes) but
+codex's own serialisation of an internal identity struct. Reimplementing that
+would mean a codex patch release flipping every hook to `modified` with no
+symptom other than an agent that stops reporting. So `codex_trust.rs` asks
+codex: one `initialize` + one `hooks/list` over `codex app-server`, which is
+part of its generated protocol schema rather than a private detail, and it
+returns the key and the current hash. Removal needs no such call, because the
+key begins with the hooks file's path.
+
+**Paths are compared canonicalised.** Codex reports the path it RESOLVED, and on
+macOS both likely scratch homes (`/tmp`, `/var/folders/...`) are symlinks under
+`/private`. A plain `==` rejects termic's own file as somebody else's and the
+install fails with "codex did not report the hooks termic just wrote". Found
+exactly that way.
+
+**Ownership is decided twice**, by the command's `termic-hooks/` prefix AND by
+the file the hook came from. A hook whose command merely looks like ours, in a
+project config someone copied from a dotfiles repo, is a stranger's script;
+trusting it on prefix alone would be termic approving arbitrary code on the
+user's behalf.
+
+**Docker writes nothing at all, and succeeds.** Inside a container both halves of
+the trust entry are unknowable from outside: the key would need the container's
+path (`/root/.codex/hooks.json`), and the app-server that reports the hash runs
+in a container that does not exist at install time. Writing hooks that are
+discovered and silently never run is the exact failure this feature removes, so
+the Docker half writes nothing and `status()` reports it off, which is true.
+Returning `Ok` matters as much as writing nothing: `agent_hooks_install` rolls
+the HOST install back when the Docker half errors, so refusing there made codex
+hooks uninstallable everywhere while every direct-install test still passed.
+
+**Two ignored tests cover this, and they need a real codex.**
+
+```sh
+cargo test --features e2e codex_hooks_install -- --ignored --nocapture  # install/trust/remove
+cargo test --features e2e codex_hooks_fire    -- --ignored --nocapture  # a live turn
+```
+
+The first asserts codex's own verdict rather than the file termic wrote, since a
+trust entry with a wrong hash is silently `modified`. The second runs a real
+turn and reads a real pty, and captured exactly this:
+
+```text
+ESC]777;notify;termic;agent ready for input BEL   SessionStart
+ESC]133;C BEL                                     UserPromptSubmit
+ESC]133;D BEL                                     Stop
+```
+
+It borrows the user's login with a SYMLINK to `auth.json` rather than a copy, so
+no credential is duplicated into a temp dir, and it never writes to the real
+`~/.codex`. It uses a real pty deliberately: the scripts write with a truncating
+redirect, which is meaningless on a character device and total on a regular
+file, so pointing `TERMIC_PTY` at a file makes a three-hook turn look like a
+one-hook turn. That cost an hour once.
+
+`PermissionRequest` is the one signal not proven by those two, because
+`codex exec` pins approvals to `never` and never reaches a prompt. It was
+measured separately by driving the real TUI to an approval prompt: the hook
+fired the instant the prompt painted, carrying `"tool_name":"Bash"`, which is
+what the shared attention body turns into `needs your permission: Bash`.
+
+One interaction worth knowing: codex's title ALSO reports `Action Required`, so a
+permission prompt now marks attention twice, once from each source. That is the
+same shape as claude's hook-then-`OSC 9` pair and it is handled by the same
+`ATTENTION_ECHO_MS` window, so it costs one banner, not two.
 
 ## agy has no attention event, so it is read from the screen
 

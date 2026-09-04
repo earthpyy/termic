@@ -187,6 +187,12 @@ const NOTIFY_PREFIX: &str = "777;notify;termic;";
 /// KEEP IN SYNC with `HOOK_OSC_BODY` in `lib/agentHooks.ts`.
 const ATTENTION_BODY: &str = "agent needs your input";
 
+/// Prefix of the body that reports the agent's own session id. Only codex sends
+/// it, because it is the only agent that can resume a session by id and cannot
+/// be handed one at launch. KEEP IN SYNC with `HOOK_OSC_SESSION_PREFIX` in
+/// `lib/agentHooks.ts`.
+const SESSION_BODY_PREFIX: &str = "session ";
+
 /// KEEP IN SYNC with `HOOK_OSC_READY_BODY` in `lib/agentHooks.ts`. Must never be
 /// a prefix of `ATTENTION_BODY` or vice versa: the TS handler routes the two
 /// apart on an exact match and would badge a ready session as needing you.
@@ -315,6 +321,30 @@ pub fn hooks_for(agent: &str) -> &'static [(&'static str, Signal)] {
         // silently, since `decision` is documented as required, so adding it
         // would risk blocking the tool for no gain.
         "agy" => &[("PreInvocation", Signal::Working), ("Stop", Signal::Done)],
+        // codex, and the reason its old "not needed" exclusion is out of date.
+        //
+        // That exclusion was argued from ATTENTION alone: codex's title says
+        // `Action Required` at +22ms, so it needed no hook to report a
+        // permission prompt. True, and beside the point for the state that
+        // actually broke. Codex is not a hooks target, so it is the ONE agent
+        // that can never reach the `hooksOwn` branch, which means every turn it
+        // runs is ended by a guess: the byte-quiet fallback calls a turn done
+        // after 4s of silence, and 4s of silence is an ordinary model
+        // round-trip. That is the GH #276 storm, and codex is the agent it was
+        // reported on.
+        //
+        // The event names are claude's exactly, which is not a coincidence:
+        // codex 0.153.0 reads a claude-shaped `hooks.json` and its own
+        // `HookEventName` enum lists the same set. Same mapping, same reasons,
+        // one difference: codex's hooks do not run until they are TRUSTED (see
+        // codex_trust.rs), which is the whole of the extra work here.
+        "codex" => &[
+            ("SessionStart", Signal::Ready),
+            ("UserPromptSubmit", Signal::Working),
+            ("PreToolUse", Signal::Working),
+            ("PermissionRequest", Signal::Attention),
+            ("Stop", Signal::Done),
+        ],
         _ => &[],
     }
 }
@@ -459,9 +489,11 @@ pub fn script_body(agent: &str, sig: Signal) -> String {
         // race the informative one, and the hook can be more specific than
         // claude is: it knows which tool is being asked about.
         //
-        // `tool_name` is claude's documented field for the tool events
-        // (PermissionRequest included), read out of 2.1.259's own embedded
-        // hooks reference: "session_id", "tool_name", "tool_input". FIRST
+        // `tool_name` is the documented field for the tool events on BOTH
+        // agents that get this guard: claude 2.1.259 documents it in its own
+        // embedded hooks reference ("session_id", "tool_name", "tool_input"),
+        // and codex 0.153.0 requires it in the `permission-request.command.input`
+        // JSON Schema its binary carries. Same field, same shape. FIRST
         // occurrence, not last, because that serialisation order puts the real
         // field before `tool_input` - the opposite of the Done guard above,
         // which needs the last one for the opposite reason.
@@ -469,7 +501,40 @@ pub fn script_body(agent: &str, sig: Signal) -> String {
         // Still no jq, same as everything else here. And still exits 0 on
         // every path: an unparseable payload falls back to the generic body
         // rather than emitting nothing.
-        ("claude", Signal::Attention) => concat!(
+        // codex reports the id of the session it just started, which is the
+        // only way termic can ever resume THAT session rather than "whatever
+        // ran last in this directory". Two repo-root tasks share a cwd, so
+        // `resume --last` hands the second one the first one's conversation;
+        // this is what closes that.
+        //
+        // `session_id` is required in codex's own `session-start.command.input`
+        // schema and was captured from a live 0.153.0 to confirm the position:
+        // it is the FIRST field, ahead of `transcript_path` and `cwd`, so the
+        // shortest-prefix match takes the real one. Measured across a fresh
+        // start AND a resume: the id is the SAME both times (`source` is what
+        // differs), so storing it on every spawn is idempotent rather than a
+        // chain of ids that has to be kept in order.
+        ("codex", Signal::Ready) => concat!(
+            "flat=$(cat | tr -d '[:space:]')\n",
+            "sid=''\n",
+            "case \"$flat\" in\n",
+            "  *'\"session_id\":\"'*)\n",
+            "    sid=${flat#*'\"session_id\":\"'}\n",
+            "    sid=${sid%%'\"'*}\n",
+            "    ;;\n",
+            "esac\n",
+            "# A session id is a UUID and nothing else. It ends up expanded into\n",
+            "# a `resume <id>` COMMAND LINE, so anything that is not plainly one\n",
+            "# is dropped rather than escaped.\n",
+            "case \"$sid\" in\n",
+            "  ????????-????-????-????-????????????) ;;\n",
+            "  *) sid='' ;;\n",
+            "esac\n",
+            "case \"$sid\" in\n",
+            "  *[!0-9a-fA-F-]*) sid='' ;;\n",
+            "esac\n",
+        ),
+        ("claude", Signal::Attention) | ("codex", Signal::Attention) => concat!(
             "flat=$(cat | tr -d '[:space:]')\n",
             "tool=''\n",
             "case \"$flat\" in\n",
@@ -517,7 +582,30 @@ pub fn script_body(agent: &str, sig: Signal) -> String {
     //     format string would be a bug waiting for the first one that is not.
     //   - the fallback is `HOOK_OSC_BODY` verbatim (`lib/agentHooks.ts`), so a
     //     payload this cannot read behaves exactly as it did before.
-    let emit = if (agent, sig) == ("claude", Signal::Attention) {
+    let emit = if (agent, sig) == ("codex", Signal::Ready) {
+        // TWO sequences, ONE write. Ready keeps its exact body because the TS
+        // side routes it on an exact match; the id rides a second sequence with
+        // its own prefix, concatenated into the same `printf`.
+        //
+        // One write rather than two calls to `emit`, and that is not tidiness:
+        // every script here writes with a TRUNCATING redirect, which is
+        // meaningless on a pty and total on a regular file. Two writes meant
+        // the id erased the ready that preceded it anywhere the target was a
+        // file, and ready is the half `seedPrompt` blocks on. Caught by the
+        // test below, which writes to a file for exactly that reason.
+        //
+        // `%s` again, never the format string.
+        format!(
+            "[ -n \"$TERMIC_PTY\" ] || exit 0\n\
+             if [ -n \"$sid\" ]; then\n\
+               emit() {{ printf '\\033]{ready}\\007\\033]{NOTIFY_PREFIX}{SESSION_BODY_PREFIX}%s\\007' \"$sid\" > \"$1\" 2>/dev/null; }}\n\
+             else\n\
+               emit() {{ printf '\\033]{ready}\\007' > \"$1\" 2>/dev/null; }}\n\
+             fi\n\
+             emit \"$TERMIC_PTY\" || emit /proc/1/fd/1 || emit /dev/tty || true",
+            ready = Signal::Ready.payload()
+        )
+    } else if sig == Signal::Attention && matches!(agent, "claude" | "codex") {
         format!(
             "[ -n \"$TERMIC_PTY\" ] || exit 0\n\
              if [ -n \"$tool\" ]; then\n\
@@ -879,6 +967,11 @@ fn settings_rel(agent: &str) -> &'static str {
         // was desynchronised from the backend. Measured; do not "simplify" this
         // to the other one.
         "agy" => "config/hooks.json",
+        // codex keeps hooks in their own file, NOT in config.toml: measured
+        // via its `hooks/list`, which reports a hook written here with
+        // `source: "user"`. config.toml is still touched, but only for the
+        // TRUST entry (codex_trust.rs), never for the hooks themselves.
+        "codex" => "hooks.json",
         _ => "settings.json",
     }
 }
@@ -1011,6 +1104,26 @@ pub fn status(target: &Target) -> HookStatus {
             // Every registered event must be present, or a partial install
             // would report as done and quietly miss a signal.
             out.installed = !hooks.is_empty() && hooks.iter().all(|(event, _)| has(event));
+            // codex only: hooks it does not TRUST are discovered, reported
+            // enabled, and never run (codex_trust.rs). Reporting "on" for those
+            // would be the UI stating the opposite of the truth, so the trust
+            // entry is part of what "installed" means here. Read from
+            // config.toml rather than asked of codex: status runs for every
+            // agent on every Settings mount and cannot spawn a process per row.
+            if agent == "codex" && out.installed && matches!(target, Target::Host(_)) {
+                let cfg = config_dir(target)
+                    .ok()
+                    .and_then(|d| std::fs::read_to_string(d.join("config.toml")).ok())
+                    .unwrap_or_default();
+                if !crate::codex_trust::is_trusted_here(&cfg, &settings) {
+                    out.installed = false;
+                    out.error = Some(
+                        "codex has the hooks but has not been told to trust them, so they \
+                         will not run. Re-install them to fix it."
+                            .into(),
+                    );
+                }
+            }
             // ANY entry is consent. A set that gained an event since this
             // install was written is incomplete, not absent, and it is the
             // case sync exists for.
@@ -1039,6 +1152,81 @@ pub fn status(target: &Target) -> HookStatus {
     out
 }
 
+/// Trace line for the trust step. It is the one part of an install that can
+/// fail for a reason outside termic (codex missing, not on PATH, an app-server
+/// that will not answer), so it says so in the same log every other work-state
+/// decision lands in rather than only in a returned error the UI may collapse.
+fn log_trust(msg: &str) {
+    crate::dlog(&format!("[agent-hooks] {msg}"));
+}
+
+/// Where codex keeps ITS config for this target, which is the same dir the
+/// hooks file lives in. `CODEX_HOME` is how a clone points codex at a second
+/// account, and `config_dir` already resolves that, so the trust entry follows
+/// the hooks into whichever home they were written to.
+fn codex_home_for(target: &Target) -> Result<PathBuf, String> {
+    config_dir(target)
+}
+
+/// The codex binary to ask. Resolved from the REGISTRY entry rather than
+/// hard-coded, so a user who renamed the command or pointed it at an absolute
+/// path gets their binary asked, not a `codex` that may not exist.
+fn codex_binary(target: &Target) -> String {
+    let agents = crate::load_settings_inner().agents;
+    crate::agent_dirs::resolve_agent(&agents, target.agent())
+        .map(|a| a.command)
+        .filter(|c| !c.trim().is_empty())
+        .unwrap_or_else(|| "codex".to_string())
+}
+
+/// Ask codex for the hash of each hook we just wrote, then record it as
+/// trusted. Fails the install when it cannot: a codex install that silently
+/// ends with untrusted hooks looks identical to a working one and reports
+/// nothing, which is the failure this whole feature exists to remove.
+fn trust_codex_hooks(target: &Target, settings: &Path, prefix: &str) -> Result<(), String> {
+    let home = codex_home_for(target)?;
+    let bin = codex_binary(target);
+    // cwd only scopes which PROJECT-level hooks codex reports; ours are
+    // user-level and are listed for any cwd. The home dir is a directory that
+    // always exists and can never be a git repo with its own `.codex`.
+    let found = crate::codex_trust::discover_ours(&bin, &home, settings, prefix, &home)?;
+    if found.is_empty() {
+        return Err(format!(
+            "codex did not report the hooks termic just wrote to {}. They would \
+             be installed but never run.",
+            settings.display()
+        ));
+    }
+    let cfg = home.join("config.toml");
+    let existing = match std::fs::read_to_string(&cfg) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("read {}: {e}", cfg.display())),
+    };
+    let next = crate::codex_trust::with_trust(&existing, &found)?;
+    write_atomic(&cfg, next.as_bytes())?;
+    log_trust(&format!("codex: trusted {} hook(s) in {}", found.len(), cfg.display()));
+    Ok(())
+}
+
+/// Remove the trust entries for the hooks file we are uninstalling.
+fn untrust_codex_hooks(target: &Target, settings: &Path) -> Result<(), String> {
+    if matches!(target, Target::Docker(_)) {
+        return Ok(());
+    }
+    let cfg = codex_home_for(target)?.join("config.toml");
+    let existing = match std::fs::read_to_string(&cfg) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("read {}: {e}", cfg.display())),
+    };
+    let next = crate::codex_trust::without_trust(&existing, settings)?;
+    if next != existing {
+        write_atomic(&cfg, next.as_bytes())?;
+    }
+    Ok(())
+}
+
 /// One script per (agent, signal). A bare absolute path with no arguments, so
 /// there is no quoting hazard inside JSON-inside-config on any agent.
 fn script_for(dir: &Path, sig: Signal) -> PathBuf {
@@ -1054,6 +1242,26 @@ pub fn install(target: &Target) -> Result<(), String> {
     // The BASE: what this agent behaves as. Paths still come from the target,
     // which carries the instance id, so a clone writes into its own config dir.
     let agent = base_of(target.agent());
+    // codex in Docker: write NOTHING, and succeed.
+    //
+    // Its hooks do not run until a trust entry names them by the path codex
+    // RESOLVED plus a hash only codex can produce (codex_trust.rs). Inside a
+    // container both are unknowable from out here: the path is the container's
+    // (`/root/.codex/hooks.json`, not the host dir termic wrote), and the
+    // app-server that would report the hash runs in a container that does not
+    // exist yet at install time.
+    //
+    // So the choice is between writing hooks that are discovered and silently
+    // never run, and writing none. None is the honest one: an install that
+    // reports success while the agent reports nothing is precisely the failure
+    // this feature exists to remove, and `status()` then says "off" for the
+    // Docker half, which is true. Returning Ok rather than Err matters as much:
+    // `agent_hooks_install` rolls the HOST install back on a Docker error, so
+    // refusing here would make codex hooks uninstallable everywhere.
+    if agent == "codex" && matches!(target, Target::Docker(_)) {
+        log_trust("codex: skipping the Docker half, its hooks cannot be trusted from outside the container");
+        return Ok(());
+    }
     let hooks = hooks_for(&agent);
     if hooks.is_empty() {
         return Err(format!("hooks are not supported for {agent} yet"));
@@ -1129,6 +1337,15 @@ pub fn install(target: &Target) -> Result<(), String> {
     bytes.push(b'\n');
     write_atomic(&settings, &bytes)?;
 
+    // codex only, and it is not optional: its hooks are discovered, reported
+    // `enabled: true`, and then NOT RUN until they are trusted. Everything
+    // above would leave a hook that fires nothing and says nothing about why.
+    // Deliberately AFTER the write, because the hash codex reports covers the
+    // hook as written. See codex_trust.rs.
+    if agent == "codex" {
+        trust_codex_hooks(target, &settings, &prefix)?;
+    }
+
     let manifest = Manifest {
         schema_version: SCHEMA_VERSION,
         command: commands.first().map(|(_, c, _)| c.clone()).unwrap_or_default(),
@@ -1149,6 +1366,19 @@ pub fn remove(target: &Target) -> Result<(), String> {
     let settings = settings_path(target)?;
     let dir = script_dir(target)?;
     let prefix = command_prefix(target)?;
+
+    // Drop codex's trust entries FIRST, and never fail the uninstall over them.
+    // They name a file that is about to stop containing our hooks, so leaving
+    // them behind is dead config pointing at nothing; but a user who removes
+    // hooks wants them gone, and refusing that because a config.toml could not
+    // be parsed would trap them. No codex call is needed here (the key begins
+    // with the hooks path), so the only way this fails is an unreadable config,
+    // which is the user's to fix and ours to leave alone.
+    if agent == "codex" {
+        if let Err(e) = untrust_codex_hooks(target, &settings) {
+            log_trust(&format!("codex untrust skipped: {e}"));
+        }
+    }
 
     // Deleting a file we wrote whole. Nothing to unmerge.
     if schema_for(&agent) == Schema::OpencodePlugin {
@@ -1217,7 +1447,7 @@ pub fn remove(target: &Target) -> Result<(), String> {
 /// row can say "not supported yet" rather than offering a button that fails.
 /// Agents this build can wire. Each needs a measured event AND a transport
 /// that reaches termic; see `event_for` / `uses_terminal_sequence`.
-pub const SUPPORTED: &[&str] = &["claude", "grok", "agy", "opencode"];
+pub const SUPPORTED: &[&str] = &["claude", "grok", "agy", "opencode", "codex"];
 
 fn check_supported(agent_id: &str) -> Result<(), String> {
     // A duplicated agent is supported when what it was cloned FROM is. It runs
@@ -2080,6 +2310,145 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
         );
     }
 
+    /// codex's `PermissionRequest` payload, transcribed from the shape a live
+    /// 0.153.0 emitted at a real approval prompt. Placeholders throughout: the
+    /// captured one carried a real home path, a real session id and a real
+    /// transcript path, none of which belong in this repo.
+    ///
+    /// The shape is the point. `tool_name` sits AFTER `hook_event_name` and
+    /// before `tool_input`, and `tool_input.description` is free-form prose
+    /// from the model, which is exactly the field that would break a naive
+    /// last-occurrence match.
+    #[cfg(unix)]
+    fn codex_permission_payload(tool: &str) -> String {
+        format!(
+            r#"{{"session_id":"00000000-0000-0000-0000-000000000000",
+               "turn_id":"00000000-0000-0000-0000-000000000001",
+               "transcript_path":"/Users/u/.codex/sessions/2026/01/01/rollout.jsonl",
+               "cwd":"/Users/u/proj","hook_event_name":"PermissionRequest",
+               "model":"gpt-5","permission_mode":"default","tool_name":"{tool}",
+               "tool_input":{{"command":"echo hello > out.txt",
+               "description":"Do you want to allow creating out.txt?"}}}}"#
+        )
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_attention_names_the_tool_too() {
+        // Measured end to end before this was written: driving a real codex TUI
+        // to an approval prompt fired PermissionRequest with `"tool_name":"Bash"`
+        // at the instant the prompt painted.
+        assert_eq!(
+            attention_body_for_agent("codex", &codex_permission_payload("Bash")),
+            "needs your permission: Bash",
+        );
+        // And the same guards apply, since it is literally the same script body.
+        assert_eq!(
+            attention_body_for_agent("codex", &codex_permission_payload("a;notify;termic;x")),
+            ATTENTION_BODY,
+        );
+    }
+
+    /// Run codex's generated READY script and return everything it put on the
+    /// pty, both sequences.
+    #[cfg(unix)]
+    fn ready_output_for(payload: &str) -> String {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+
+        let dir = std::env::temp_dir().join(format!(
+            "termic-ready-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("ready.sh");
+        let pty = dir.join("pty");
+        std::fs::write(&script, script_body("codex", Signal::Ready)).unwrap();
+        std::fs::write(&pty, "").unwrap();
+        let mut child = Command::new("/bin/sh")
+            .arg(&script)
+            .env("TERMIC_TASK_ID", "t1")
+            .env("TERMIC_PTY", &pty)
+            .env_remove("GROK_HOOK_EVENT")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+        {
+            use std::io::Write as _;
+            child.stdin.as_mut().unwrap().write_all(payload.as_bytes()).unwrap();
+        }
+        assert!(child.wait().unwrap().success(), "a hook must never exit non-zero");
+        let mut out = String::new();
+        std::fs::File::open(&pty).unwrap().read_to_string(&mut out).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
+    /// codex's `SessionStart` payload, transcribed from a live 0.153.0 with
+    /// placeholders for the paths. Field ORDER matters: `session_id` comes
+    /// first, ahead of `transcript_path`, and `transcript_path` embeds the same
+    /// uuid a second time, which is what a last-occurrence match would find.
+    #[cfg(unix)]
+    fn codex_session_start_payload(sid: &str) -> String {
+        format!(
+            r#"{{"session_id":"{sid}",
+               "transcript_path":"/Users/u/.codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-{sid}.jsonl",
+               "cwd":"/Users/u/proj","hook_event_name":"SessionStart",
+               "model":"gpt-5","permission_mode":"default","source":"startup"}}"#
+        )
+    }
+
+    // Repo-root resume for codex hangs entirely off this one line of shell: no
+    // id reported means no id stored, which means `resume --last` and the wrong
+    // task's conversation.
+    #[test]
+    #[cfg(unix)]
+    fn codex_ready_reports_the_session_id_alongside_ready() {
+        let sid = "01a06adc-eeb5-77a0-b603-d7b670dd11e7";
+        let out = ready_output_for(&codex_session_start_payload(sid));
+        assert!(
+            out.contains(&format!("{NOTIFY_PREFIX}{READY_BODY}")),
+            "ready must still be sent, unchanged: {out:?}"
+        );
+        assert!(
+            out.contains(&format!("{NOTIFY_PREFIX}{SESSION_BODY_PREFIX}{sid}")),
+            "the session id never made it to the pty: {out:?}"
+        );
+        // Ready FIRST. `seedPrompt` waits on it, and an id arriving ahead of it
+        // would be the tab reporting a session before it reports being usable.
+        assert!(
+            out.find(READY_BODY).unwrap() < out.find(SESSION_BODY_PREFIX).unwrap(),
+            "ready must precede the session id: {out:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_ready_still_reports_ready_when_there_is_no_usable_id() {
+        // Ready is the load-bearing half: `seedPrompt` refuses to type into an
+        // agent that reports readiness and has not reported it, so a payload
+        // this cannot parse must NOT cost the tab its ready signal.
+        for payload in [
+            String::new(),
+            r#"{"hook_event_name":"SessionStart","cwd":"/Users/u/p"}"#.to_string(),
+            // Not a uuid: rejected rather than escaped, because it would be
+            // expanded into a `resume <id>` command line.
+            codex_session_start_payload("not-a-uuid"),
+            codex_session_start_payload("../../etc/passwd"),
+            codex_session_start_payload("$(rm -rf /)"),
+        ] {
+            let out = ready_output_for(&payload);
+            assert!(out.contains(READY_BODY), "ready lost for {payload:?}: {out:?}");
+            assert!(
+                !out.contains(SESSION_BODY_PREFIX),
+                "a bad id must not be reported: {out:?}"
+            );
+        }
+    }
+
     // The body must survive the TS side, which is the failure mode with no
     // symptom: the hook fires correctly and termic drops it on the floor.
     #[test]
@@ -2093,6 +2462,250 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
         // id and the trusted sender and is told apart by an exact match alone.
         assert_ne!(ATTENTION_BODY, READY_BODY);
         assert!(!"needs your permission: Bash".starts_with(READY_BODY));
+    }
+
+    /// The whole codex loop against a REAL `codex` binary: install, trust,
+    /// verify codex agrees, remove, verify nothing of ours is left.
+    ///
+    /// `#[ignore]`d because it needs codex on PATH, which CI does not have. Run
+    /// it with a real one:
+    ///
+    /// ```sh
+    /// cargo test --features e2e codex_hooks_install -- --ignored --nocapture
+    /// ```
+    ///
+    /// It writes ONLY into a temp dir: `TERMIC_E2E_AGENT_HOME` moves the agent
+    /// home, and `CODEX_HOME` follows it because `config_dir` derives one from
+    /// the other. The user's own `~/.codex` is never opened.
+    ///
+    /// The assertion that matters is not "we wrote a trust entry" but "codex
+    /// says trusted". A trust entry with the wrong hash is silently `modified`
+    /// and the hook never runs, so only codex's own verdict proves the install.
+    #[test]
+    #[ignore = "needs a real codex binary on PATH"]
+    #[cfg(all(unix, feature = "e2e"))]
+    fn codex_hooks_install_is_trusted_by_codex_and_leaves_nothing_behind() {
+        let home = std::env::temp_dir().join(format!("termic-codex-e2e-{}", std::process::id()));
+        let codex_home = home.join(".codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::env::set_var("TERMIC_E2E_AGENT_HOME", &home);
+
+        // A config.toml the user "already had", so the trust write has to
+        // preserve something rather than starting from an empty file.
+        let original_config = "model = \"gpt-5.6-sol\"\n\n[tui]\nnotifications = true\n";
+        std::fs::write(codex_home.join("config.toml"), original_config).unwrap();
+
+        let target = Target::Host("codex".into());
+        install(&target).expect("install codex hooks");
+
+        // 1. The hooks file exists and holds one group per registered event.
+        let hooks_json = codex_home.join("hooks.json");
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_json).unwrap()).unwrap();
+        for (event, _) in hooks_for("codex") {
+            assert!(
+                v["hooks"][event].as_array().is_some_and(|g| !g.is_empty()),
+                "{event} missing from {}",
+                hooks_json.display()
+            );
+        }
+
+        // 2. The user's own config survived, and trust was added beside it.
+        let cfg = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
+        assert!(cfg.contains("gpt-5.6-sol"), "the user's config was clobbered:\n{cfg}");
+        assert!(cfg.contains("[tui]"));
+        assert!(cfg.contains("trusted_hash"), "no trust written:\n{cfg}");
+
+        // 3. THE assertion: codex itself agrees. Anything wrong with the key or
+        //    the hash shows up here as `untrusted`/`modified`, which is exactly
+        //    how this fails in the field - silently.
+        let bin = "codex";
+        let found = crate::codex_trust::discover_ours(
+            bin,
+            &codex_home,
+            &hooks_json,
+            &command_prefix(&target).unwrap(),
+            &codex_home,
+        )
+        .expect("codex app-server hooks/list");
+        assert_eq!(
+            found.len(),
+            hooks_for("codex").len(),
+            "codex did not report every hook we wrote: {found:?}"
+        );
+        for h in &found {
+            eprintln!("  codex says: {} -> {}", h.key, h.trust_status);
+            assert_eq!(h.trust_status, "trusted", "hook not trusted: {h:?}");
+        }
+
+        // 4. Status agrees too, so the UI is not claiming something else.
+        assert!(status(&target).installed, "status must see a complete install");
+
+        // 5. The command the UI actually calls, which does BOTH targets and
+        //    rolls the host back if the Docker half errors. An earlier version
+        //    of the Docker guard returned Err here and made codex hooks
+        //    uninstallable everywhere while every direct-install test passed.
+        remove(&target).expect("reset before the command-level install");
+        let full = agent_hooks_install("codex".into()).expect("agent_hooks_install");
+        assert!(full.supported, "codex must report as supported");
+        assert!(full.host.installed, "the host half must be installed");
+        assert!(
+            !full.docker.installed,
+            "the Docker half must report OFF rather than claiming hooks that cannot run"
+        );
+
+        // 6. Status is HONEST about trust, not just about the hooks file.
+        //    Strip the trust the way a user editing config.toml would, and the
+        //    row must stop claiming "on": those hooks are still on disk, still
+        //    reported `enabled` by codex, and still run nothing.
+        let cfg_path = codex_home.join("config.toml");
+        let stripped =
+            crate::codex_trust::without_trust(&std::fs::read_to_string(&cfg_path).unwrap(), &hooks_json)
+                .unwrap();
+        std::fs::write(&cfg_path, &stripped).unwrap();
+        let untrusted = status(&target);
+        assert!(!untrusted.installed, "status must not claim untrusted hooks are on");
+        assert!(
+            untrusted.error.as_deref().is_some_and(|e| e.contains("trust")),
+            "and it must say why: {:?}",
+            untrusted.error
+        );
+        // Re-installing is the documented fix, so it has to actually work.
+        install(&target).expect("re-install after trust was stripped");
+        assert!(status(&target).installed, "re-install must restore trust");
+
+        // 7. Removal takes the hooks AND the trust with it, and hands the
+        //    user's config.toml back byte-identical.
+        remove(&target).expect("remove codex hooks");
+        let after = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
+        assert_eq!(after, original_config, "config.toml must come back unchanged");
+        let left = std::fs::read_to_string(&hooks_json).unwrap_or_default();
+        assert!(
+            !left.contains(SCRIPT_DIR),
+            "our commands are still in hooks.json:\n{left}"
+        );
+        assert!(!status(&target).ours_present, "status still sees our entries");
+
+        std::env::remove_var("TERMIC_E2E_AGENT_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The other half, and the one that cannot be argued from a config file:
+    /// does a REAL codex turn actually run these hooks and put termic's OSC on
+    /// the terminal it was handed?
+    ///
+    /// `#[ignore]`d and separate from the install test because it costs a live
+    /// model call on the user's own account. Run it deliberately:
+    ///
+    /// ```sh
+    /// cargo test --features e2e codex_hooks_fire -- --ignored --nocapture
+    /// ```
+    ///
+    /// It borrows the user's login with a SYMLINK to `auth.json` rather than a
+    /// copy, so no credential is ever duplicated into a temp dir, and the real
+    /// `~/.codex` is never written to. `TERMIC_PTY` points at a plain file,
+    /// which is how the scripts address a pty anyway (they redirect into a
+    /// path), so this needs no terminal.
+    #[test]
+    #[ignore = "spends a real codex turn on the user's account"]
+    #[cfg(all(unix, feature = "e2e"))]
+    fn codex_hooks_fire_on_a_real_turn() {
+        let home = std::env::temp_dir().join(format!("termic-codex-fire-{}", std::process::id()));
+        let codex_home = home.join(".codex");
+        let work = home.join("work");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+
+        let real_auth = dirs::home_dir().unwrap().join(".codex/auth.json");
+        if !real_auth.exists() {
+            eprintln!("SKIP: no ~/.codex/auth.json, cannot make a live call");
+            return;
+        }
+        std::os::unix::fs::symlink(&real_auth, codex_home.join("auth.json")).unwrap();
+
+        std::env::set_var("TERMIC_E2E_AGENT_HOME", &home);
+        let target = Target::Host("codex".into());
+        install(&target).expect("install codex hooks");
+
+        // A REAL pty, not a file. The scripts write with a TRUNCATING redirect
+        // (`> "$1"`), which is meaningless on a character device and total on a
+        // regular file: pointed at a file, each hook erases the one before it
+        // and a three-hook turn ends with only the last sequence on disk. Found
+        // exactly that way, and it would have hidden two of the three signals
+        // this test exists to prove.
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .expect("open a pty");
+        let pty_path = crate::pty_slave_path(&pair.master).expect("pty slave path");
+        let mut reader = pair.master.try_clone_reader().expect("pty reader");
+        let seen_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let sink = seen_buf.clone();
+        std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 { break }
+                sink.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        });
+        let pty = std::path::PathBuf::from(&pty_path);
+        let out = std::process::Command::new("codex")
+            .args(["exec", "--skip-git-repo-check", "reply with the single word ok"])
+            .current_dir(&work)
+            .env("CODEX_HOME", &codex_home)
+            .env("TERMIC_PTY", &pty)
+            .env("TERMIC_TASK_ID", "live-fire")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run codex exec");
+        let transcript = String::from_utf8_lossy(&out.stdout).to_string()
+            + &String::from_utf8_lossy(&out.stderr);
+        // The hooks write asynchronously through a pty; give the reader a beat
+        // to drain what the child wrote just before it exited.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let seen = String::from_utf8_lossy(&seen_buf.lock().unwrap()).to_string();
+        eprintln!("--- codex said ---\n{}", transcript.chars().take(1200).collect::<String>());
+        eprintln!("--- pty got {} bytes ---\n{seen:?}", seen.len());
+
+        // Ready, working and done are the three the state machine cannot run
+        // without. Attention needs a permission prompt, which a read-only
+        // one-shot never reaches, so it is proven by the install test agreeing
+        // codex registered it rather than by firing here.
+        assert!(seen.contains("777;notify;termic;agent ready for input"),
+            "SessionStart (ready) never reached the pty");
+        assert!(seen.contains("133;C"), "working never reached the pty");
+        assert!(seen.contains("133;D"), "Stop (done) never reached the pty");
+        // Order matters as much as presence: a done before any working is a
+        // turn termic would ignore, since a hard idle is dropped unless we
+        // were working.
+        assert!(seen.find("133;C").unwrap() < seen.rfind("133;D").unwrap(),
+            "done arrived before working: {seen:?}");
+
+        // The session id, which is what makes repo-root resume possible at all:
+        // several tasks share the repo root's cwd, so `resume --last` there is
+        // another task's conversation. codex cannot be HANDED an id at launch,
+        // so it has to report the one it chose.
+        let reported = seen
+            .split("\u{1b}]777;notify;termic;session ")
+            .nth(1)
+            .and_then(|rest| rest.split('\u{7}').next())
+            .map(str::to_string)
+            .expect(&format!("no session id reported: {seen:?}"));
+        // It must be the id codex actually used, not merely a well-formed one.
+        assert!(
+            transcript.contains(&reported),
+            "reported {reported} is not the session codex announced:\n{transcript}"
+        );
+        // Ready first: seedPrompt blocks on it, and both ride ONE write, which
+        // is why a truncating redirect cannot cost us the ready half.
+        assert!(
+            seen.find("agent ready for input").unwrap() < seen.find("session ").unwrap(),
+            "ready must precede the session id: {seen:?}"
+        );
+
+        remove(&target).expect("remove codex hooks");
+        std::env::remove_var("TERMIC_E2E_AGENT_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// One payload per background-task type claude can report, in the shape
