@@ -16469,6 +16469,127 @@ fn default_agents() -> Vec<Agent> {
                 command: "opencode session list | grep -m1 '^ses_' | cut -d' ' -f1".into(),
             }),
         },
+        Agent {
+            // Muse Code — Meta's terminal coding agent, running the Muse Spark
+            // model family (GH #275). Measured against a live Muse Code 1.0.2
+            // (1.0.2-R2040.1), not the help text, using its offline `--provider
+            // echo` so no Meta account was involved:
+            //   --yolo              "Disable approval and sandboxing and trust
+            //                       this workspace for this run" — one flag
+            //                       covers what claude needs
+            //                       --dangerously-skip-permissions for, and it
+            //                       also skips the first-run trust prompt.
+            //   resume --last       subcommand form, most-recent session in
+            //                       this workspace. Composes with globals on
+            //                       either side: `muse --yolo resume --last`
+            //                       resumed a session with its history intact.
+            //                       With no prior session it prints "no
+            //                       retained sessions found for this
+            //                       workspace" and exits 1, which is the clean
+            //                       failure TerminalPane's failedResume path
+            //                       already relaunches from.
+            //   NO id-based resume  `muse resume <session-uuid>` exists, but
+            //                       nothing MINTS an id for the TUI:
+            //                       `--session-id` is an `exec` (headless)
+            //                       flag only, and the TUI rejects it outright
+            //                       ("unexpected argument '--session-id'").
+            //                       So session_id_args/resume_id_args stay
+            //                       empty as a measured fact — see the
+            //                       matching note in lib/agents.ts.
+            //   no --name           nothing surfaces termic's task name.
+            id: "muse".into(),
+            display_name: "muse".into(),
+            command: "muse".into(),
+            // No base args. Muse's own approval prompt and seatbelt sandbox
+            // are on by default and stay that way: see docs/sandbox.md on the
+            // nesting, and `--trust-workspace` is the user's call, not ours.
+            args: vec![],
+            icon_id: "muse".into(),
+            color: "#0064e0".into(),
+            builtin: true,
+            disabled: false,
+            capabilities: AgentCapabilities {
+                yolo_args: vec!["--yolo".into()],
+                // No slash command for a live approval-mode switch.
+                runtime_yolo_command: String::new(),
+                runtime_default_command: String::new(),
+                resume_args: vec!["resume".into(), "--last".into()],
+                session_id_args: vec![],
+                // Repo-root tasks share one cwd, so `resume --last` there is
+                // whichever task ran most recently, not this one. muse cannot
+                // be handed an id at launch (its TUI rejects `--session-id`,
+                // which is an `exec` flag), so it takes opencode's shape: the
+                // id is CAPTURED after the fact and replayed here. Verified on
+                // a live 1.0.2 through `--provider echo`: `muse resume <uuid>`
+                // prints "resumed session <uuid>" and redraws the prior turns.
+                resume_id_args: vec!["resume".into(), "{UUID}".into()],
+                name_args: vec![],
+                signals: AgentSignals::default(),
+                match_output: false,
+            },
+            env: std::collections::HashMap::new(),
+            // Empty = a Docker spawn uses `env` above, unchanged.
+            docker_env: std::collections::HashMap::new(),
+            sandbox_allowed_paths: vec![
+                // Auth + enterprise config.
+                "$HOME/.config/muse".into(),
+                // Session logs (`sessions/YYYY/MM/DD/<uuid>/`), bundled
+                // skills, plugin cache, the local trace dir. Everything
+                // `resume --last` reads lives here.
+                "$HOME/.local/share/muse".into(),
+                // macOS-native state, which muse uses ALONGSIDE the XDG dirs
+                // rather than instead of them. `session-name-authority/`
+                // (authority.json + session-names.db) is READ AND WRITTEN on
+                // every launch, so leaving this out does not degrade muse, it
+                // stops it: the cage denies the write and muse fails with
+                // "Agent Definition filesystem source failed: IoError" the
+                // moment a sandboxed task starts. Reported, then found exactly
+                // by termic's own monitoring mode, which listed this path with
+                // `read-data write-data 3 files - 16x`.
+                //
+                // Every other built-in already carries its equivalent
+                // (Claude, Codex, Antigravity, GitHub Copilot, Grok,
+                // opencode); muse was simply missing one.
+                "$HOME/Library/Application Support/Muse".into(),
+                // muse's OWN files in ~/.local/bin, and nothing else in it.
+                //
+                // The install is a launcher shim that re-execs a versioned
+                // sibling (`muse-bin-<version>`), keeps its update state in
+                // `.muse-*` dotfiles beside it, and stages downloads through
+                // `.muse-launcher.XXXXXX` temp files. All of that needs WRITE,
+                // because `sandbox_allowed_paths` grants `file-write*`.
+                //
+                // Which is exactly why this is a regex and not the directory.
+                // `~/.local/bin` is the shared install dir: claude, agy, grok
+                // and codex all keep a binary or a shim there. Allowing the
+                // subpath would let a muse task overwrite another agent's
+                // binary, which is a wider grant than any other built-in asks
+                // for and is not what muse needs. Same shape as claude's
+                // sidecar regex above, for the same reason.
+                "regex:^$HOME/\\.local/bin/(muse|muse-bin-[^/]*|\\.muse-[^/]*)$".into(),
+            ],
+            sandbox_allowed_hosts: vec![],
+            work_done: true,
+            extends: None,
+            kind: "agent".into(),
+            // It IS opencode's shape after all: muse cannot be TOLD an id, but
+            // it writes one, so the id is read back off disk once the tab has
+            // a session. Sessions live at
+            // `$XDG_DATA_HOME/muse/sessions/YYYY/MM/DD/<uuid>/`, so the newest
+            // directory four levels down is the session this tab just made.
+            //
+            // Same caveat opencode's capture has, and worth knowing: "newest"
+            // is not "this tab's" if two tasks in the SAME cwd both created a
+            // session between this tab's spawn and its first exit. In practice
+            // the capture runs on that tab's own first exit, so the race needs
+            // two repo-root tasks finishing their first turn in the same
+            // moment.
+            post_launch_capture: Some(PostLaunchCapture {
+                command: "ls -td \"${XDG_DATA_HOME:-$HOME/.local/share}/muse/sessions\"/*/*/*/*/ \
+                          2>/dev/null | head -1 | sed \"s:/*$::;s:.*/::\""
+                    .into(),
+            }),
+        },
     ]
 }
 
@@ -20555,6 +20676,92 @@ mod tests {
         // pi mints deterministically, so it must NOT use opencode's
         // post-exit capture path.
         assert!(pi.post_launch_capture.is_none());
+    }
+
+    // Muse Code 1.0.2, measured against a live binary via its offline
+    // `--provider echo`. The entry a reviewer is most likely to want to
+    // "finish" is the empty id-resume pair, so this pins WHY it is empty:
+    // `--session-id` is an `exec`-only flag and the TUI rejects it, so there
+    // is no way to mint a termic-owned session for an interactive spawn. Do
+    // not copy claude's two-flag shape in here.
+    #[test]
+    fn muse_resumes_by_captured_id_and_cannot_mint_a_session() {
+        let agents = seeded_defaults().agents;
+        let muse = agents.iter().find(|a| a.id == "muse").expect("muse seeded");
+        assert_eq!(muse.capabilities.resume_args, vec!["resume", "--last"]);
+        // No MINT: `--session-id` is an `exec` flag and the TUI rejects it, so
+        // termic can never hand muse an id at launch. That is the half that
+        // stays empty; `resume_id_args` is not, because muse can resume an id
+        // it chose itself (see the capture below).
+        assert!(muse.capabilities.session_id_args.is_empty());
+        // No --name equivalent in muse's help.
+        assert!(muse.capabilities.name_args.is_empty());
+        // One flag drops approval AND muse's own sandbox AND the trust prompt.
+        assert_eq!(muse.capabilities.yolo_args, vec!["--yolo"]);
+        // Auth lives in ~/.config/muse, sessions in ~/.local/share/muse; the
+        // cage needs both or `resume --last` finds nothing.
+        assert!(muse.sandbox_allowed_paths.iter().any(|p| p.ends_with(".config/muse")));
+        assert!(muse.sandbox_allowed_paths.iter().any(|p| p.ends_with(".local/share/muse")));
+        // macOS state, WRITTEN on every launch. Its absence is not a
+        // degradation, it is muse refusing to start under the cage.
+        assert!(
+            muse.sandbox_allowed_paths.iter()
+                .any(|p| p == "$HOME/Library/Application Support/Muse"),
+            "muse writes ~/Library/Application Support/Muse/session-name-authority on launch"
+        );
+        // NOT granted, and deliberately: muse reads other agents' config as
+        // "foreign personal context", and termic handing a muse task the
+        // user's codex config would be a cross-agent leak the user never
+        // asked for. It has its own flag for that (`--no-foreign-personal-context`).
+        assert!(
+            !muse.sandbox_allowed_paths.iter().any(|p| p.contains(".codex")),
+            "muse must not be granted another agent's config dir"
+        );
+        // ~/.local/bin is the SHARED install dir (claude, agy, grok and codex
+        // all keep a binary or shim there) and these paths grant `file-write*`,
+        // so muse gets a regex over its own files rather than the directory.
+        // Granting the subpath would let a muse task overwrite another agent's
+        // binary.
+        assert!(
+            !muse.sandbox_allowed_paths.iter().any(|p| p == "$HOME/.local/bin"),
+            "muse must not be granted write over the whole shared bin dir"
+        );
+        let bin_rule = muse.sandbox_allowed_paths.iter()
+            .find(|p| p.contains(".local/bin"))
+            .expect("muse still needs its own files in the install dir");
+        assert!(bin_rule.starts_with("regex:"), "must be scoped, got {bin_rule}");
+        for f in ["muse", "muse-bin-1.0.2-R2040.1", ".muse-version", ".muse-update-checked-at"] {
+            assert!(
+                regex::Regex::new(&bin_rule["regex:".len()..].replace("$HOME", "/Users/u"))
+                    .unwrap()
+                    .is_match(&format!("/Users/u/.local/bin/{f}")),
+                "muse's own {f} must stay writable"
+            );
+        }
+        for f in ["claude", "codex", "agy", "grok", "amusement"] {
+            assert!(
+                !regex::Regex::new(&bin_rule["regex:".len()..].replace("$HOME", "/Users/u"))
+                    .unwrap()
+                    .is_match(&format!("/Users/u/.local/bin/{f}")),
+                "{f} is another agent's binary and must NOT be writable by muse"
+            );
+        }
+        assert_eq!(muse.icon_id, "muse");
+        // It CAN resume a specific session, it just cannot be handed the id at
+        // launch, so the id is captured off disk afterwards (opencode's shape).
+        assert_eq!(muse.capabilities.resume_id_args, vec!["resume", "{UUID}"]);
+        let cap = muse.post_launch_capture.as_ref().expect("muse captures its session id");
+        // The shape that makes it work, spelled out because each part is load
+        // bearing: newest-first (`-t`), directories four levels down
+        // (YYYY/MM/DD/<uuid>), XDG-aware, and quiet when there are none yet.
+        assert!(cap.command.contains("muse/sessions"), "{}", cap.command);
+        assert!(cap.command.contains("XDG_DATA_HOME"), "{}", cap.command);
+        assert!(cap.command.contains("/*/*/*/*/"), "{}", cap.command);
+        assert!(cap.command.contains("-td"), "newest first: {}", cap.command);
+        assert!(cap.command.contains("2>/dev/null"), "quiet when absent: {}", cap.command);
+        // The line continuation above must not have eaten the separating
+        // space; without it the glob and the redirect fuse into one word.
+        assert!(!cap.command.contains("/*/2>"), "lost a space: {}", cap.command);
     }
 
     #[test]

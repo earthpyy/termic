@@ -224,6 +224,13 @@ pub fn state_dirs(agent_id: &str) -> &'static [&'static str] {
         // install.sh can put it in `~/.pi/agent/bin`, which would be grok's
         // situation exactly. See assets/Dockerfile.default.
         "pi" => &[".pi"],
+        // Muse Code follows XDG: auth + enterprise config in `.config/muse`,
+        // session logs / bundled skills / plugin cache in
+        // `.local/share/muse`. Neither holds the binary (the launcher shim
+        // and its versioned `muse-bin-<version>` sibling live in
+        // `.local/bin`), so unlike grok these are safe to mount over in
+        // Docker — see assets/Dockerfile.default.
+        "muse" => &[".config/muse", ".local/share/muse"],
         // grok: binary, bundled skills, and config all live under `.grok`
         // with no clean relocation env. Listed here for Seatbelt (which
         // allows the real path regardless); `docker::agent_config` still

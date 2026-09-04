@@ -2196,6 +2196,112 @@ describe("settings reorder drags", () => {
   });
 });
 
+// Every built-in agent ships as DATA (`default_agents()` in lib.rs) but needs
+// two hand-written frontend pieces to look like itself: a `case` in
+// `CliIcon` and an entry in `CLI_BRAND_COLOR`. Miss either and the agent still
+// works, so nothing fails, it just draws the generic terminal chevron in an
+// untinted grey. That is the exact seam a new built-in is added through, so
+// this walks the registry rather than naming agents: adding one to Rust and
+// forgetting its icon fails here.
+describe("every built-in agent renders as itself", () => {
+  const builtinIds = () =>
+    browser.execute(() =>
+      window.__termic!.useApp.getState().agents
+        .filter((a: any) => a.builtin && (a.kind ?? "agent") === "agent")
+        .map((a: any) => a.id as string),
+    ) as Promise<string[]>;
+
+  before(async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    await dismissOverlays();
+    await browser.execute(() =>
+      window.__termic!.useApp.getState().openSettings("agents"),
+    );
+    await waitVisible('[data-agent-id][data-kind="agent"]');
+  });
+
+  after(async () => {
+    await browser.execute(() => window.__termic!.useApp.getState().closeSettings());
+  });
+
+  it("gives each one a pill with its own brand mark, not the fallback glyph", async () => {
+    const ids = await builtinIds();
+    // The seeded profile's settings.json predates several built-ins, so this
+    // also proves load_settings_inner still merges new ones in on upgrade
+    // rather than only seeding them on a fresh install.
+    expect(ids.length).toBeGreaterThan(1);
+
+    const missing = (await browser.execute(
+      (wanted: string[]) =>
+        wanted.filter((id) => !document.querySelector(`[data-agent-id="${id}"]`)),
+      ids,
+    )) as string[];
+    expect(missing).toEqual([]);
+
+    // `data-cli-icon="fallback"` is set only by CliIcon's default branch, so
+    // its presence inside a pill IS the missing-case bug.
+    const fallbacks = (await browser.execute(
+      (wanted: string[]) =>
+        wanted.filter((id) => !!document.querySelector(
+          `[data-agent-id="${id}"] [data-cli-icon="fallback"]`)),
+      ids,
+    )) as string[];
+    expect(fallbacks).toEqual([]);
+
+    // And the tint: an id with no CLI_BRAND_COLOR entry falls back to
+    // fg-dim, which is what an unstyled brand icon looks like.
+    const untinted = (await browser.execute(
+      (wanted: string[]) =>
+        wanted.filter((id) => {
+          const el = document.querySelector(`[data-agent-id="${id}"] [data-icon-id]`);
+          return !el || !(el as HTMLElement).className.includes(`--color-cli-${id}`);
+        }),
+      ids,
+    )) as string[];
+    expect(untinted).toEqual([]);
+  });
+
+  it("mounts the picked agent's card with the command it will actually spawn", async () => {
+    const ids = await builtinIds();
+    // Walk them all: only the ACTIVE agent's card is mounted, so a built-in
+    // whose card throws on a field the others do not set is invisible until
+    // someone clicks it.
+    for (const id of ids) {
+      await browser.execute((a) => {
+        const p = document.querySelector(`[data-agent-id="${a}"]`) as HTMLElement | null;
+        if (!p) throw new Error(`no agent pill for ${a}`);
+        p.click();
+      }, id);
+      await browser.waitUntil(
+        async () => (await browser.execute(
+          (a) => !!document.querySelector(`[data-agent-card="${a}"]`), id,
+        )) as boolean,
+        { timeout: 8_000, timeoutMsg: `the ${id} card never mounted` },
+      );
+      // The card is the only place the spawn command is editable, so what it
+      // must show is the registry's own value. Matched against the store
+      // rather than a hardcoded string, so this stays true for an agent
+      // whose display name and binary differ (Antigravity / `agy`).
+      const shown = (await browser.execute((a) => {
+        const app = window.__termic!.useApp.getState();
+        const want = app.agents.find((x: any) => x.id === a)?.command ?? "";
+        const card = document.querySelector(`[data-agent-card="${a}"]`) as HTMLElement | null;
+        const values = [...(card?.querySelectorAll("input") ?? [])]
+          .map((i) => (i as HTMLInputElement).value);
+        return { want, hasCommandField: !!card?.innerText.includes("Command"), values };
+      }, id)) as { want: string; hasCommandField: boolean; values: string[] };
+      // Compared as objects carrying `id`, so a failure inside the loop says
+      // WHICH built-in broke. A bare boolean assertion here reports only
+      // "expected false to be true" and leaves you rerunning to find out.
+      expect({ id, command: shown.want.length > 0 }).toEqual({ id, command: true });
+      expect({ id, commandField: shown.hasCommandField }).toEqual({ id, commandField: true });
+      expect({ id, shows: shown.values.includes(shown.want) })
+        .toEqual({ id, shows: true });
+    }
+  });
+});
+
 // A project's Default CLI is a stored agent id, and the agent registry it
 // names is edited on another page entirely (reordered, renamed, removed). The
 // three tests here pin the contract between the two: the settings control

@@ -125,7 +125,7 @@ struct AgentConfig {
 /// only lists dirs `docs/plans/docker-sandbox/findings.md` actually
 /// verified. grok is the one exception still declined outright: binary +
 /// skills + config all live under `~/.grok`, no clean relocation env.
-pub const KNOWN_SAFE_AGENTS: &[&str] = &["claude", "codex", "copilot", "agy", "antigravity", "opencode", "pi"];
+pub const KNOWN_SAFE_AGENTS: &[&str] = &["claude", "codex", "copilot", "agy", "antigravity", "opencode", "pi", "muse"];
 
 /// Whether an agent OUTSIDE `KNOWN_SAFE_AGENTS` can even be offered the
 /// opt-in "persist config in Docker mode" toggle at all. `false` for grok
@@ -144,7 +144,7 @@ pub fn persist_offerable(agent_id: &str) -> bool {
 /// built-in name. Falls back to the id itself when the registry cannot be read,
 /// which is the same answer `base_agent_id` gives for an unknown agent.
 pub fn base_agent_id_str(id: &str) -> &'static str {
-    const BUILTINS: &[&str] = &["claude", "codex", "copilot", "agy", "antigravity", "opencode", "pi", "grok", "gemini"];
+    const BUILTINS: &[&str] = &["claude", "codex", "copilot", "agy", "antigravity", "opencode", "pi", "grok", "gemini", "muse"];
     let agents = crate::load_settings_inner().agents;
     let base = base_agent_id(&agents, id);
     BUILTINS.iter().copied().find(|b| *b == base).unwrap_or("claude")
@@ -2625,6 +2625,31 @@ mod tests {
                 "{:?}", spec.mounts);
         });
     }
+
+    #[test]
+    fn muse_sessions_are_mounted_so_they_survive_a_container() {
+        // A container is `--rm`, so anything muse writes outside a mount is
+        // gone the moment the task stops, and `resume` has nothing to find.
+        // Its sessions live under `.local/share/muse/sessions/`, which is the
+        // SECOND state dir: the first becomes the primary config mount and the
+        // rest are mounted alongside it, so both have to be listed or the one
+        // that matters silently is not there.
+        assert_eq!(
+            crate::agent_dirs::state_dirs("muse"),
+            &[".config/muse", ".local/share/muse"],
+        );
+        let cfg = agent_config("muse", &[], false).expect("muse is a known-safe agent");
+        assert_eq!(cfg.container_dir, "/root/.config/muse");
+        assert!(
+            cfg.extra_dirs.contains(&"/root/.local/share/muse".to_string()),
+            "sessions dir is not mounted: {:?}", cfg.extra_dirs,
+        );
+        // And it maps to a stable host path under termic's own agent folder,
+        // which is what makes it persist ACROSS containers rather than merely
+        // outliving one.
+        assert_eq!(host_subpath_for("/root/.local/share/muse"), "local/share/muse");
+    }
+
 
     #[test]
     fn a_stale_allowed_path_is_skipped_instead_of_failing_the_whole_run() {

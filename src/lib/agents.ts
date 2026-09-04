@@ -206,6 +206,32 @@ const BUILTIN_FALLBACK: Record<string, Pick<Agent, "command" | "args" | "post_la
       command: "opencode session list | grep -m1 '^ses_' | cut -d' ' -f1",
     },
   },
+  // Muse Code (Meta). Mirrors the Rust seeded default in lib.rs; the two
+  // tables must agree, since this one is what runs before the registry loads.
+  // The empty id-resume pair is deliberate and measured: `muse resume <uuid>`
+  // exists, but `--session-id` is an `exec` (headless) flag that the TUI
+  // rejects outright, so nothing can mint a termic-owned session for an
+  // interactive spawn. Do not "fix" this into claude's two-flag shape.
+  muse: {
+    command: "muse", args: [],
+    capabilities: {
+      // One flag drops approval, muse's own sandbox, and the trust prompt.
+      yolo_args: ["--yolo"],
+      runtime_yolo_command: "",
+      // Subcommand form, like codex. Composes with globals on either side,
+      // verified: `muse --yolo resume --last` resumed with history intact.
+      // Right for a worktree; in the repo root "last" is another task's
+      // session, which is what the captured id below is for.
+      resume_args: ["resume", "--last"],
+      // No `session_id_args` pair: muse cannot be handed an id at launch, so
+      // this is the CAPTURE shape (`cliSupportsCaptureResume`), same as
+      // opencode. The id comes off disk, not from the agent.
+      resume_id_args: ["resume", "{UUID}"],
+    },
+    post_launch_capture: {
+      command: 'ls -td "${XDG_DATA_HOME:-$HOME/.local/share}/muse/sessions"/*/*/*/*/ 2>/dev/null | head -1 | sed "s:/*$::;s:.*/::"',
+    },
+  },
 };
 
 /** Helper to get an agent's display name by its id. Consulting the registry first,
@@ -366,6 +392,21 @@ export const BUILTIN_TITLE_SIGNALS: Record<string, Required<SignalPatterns>> = {
     busy: ["^\\s*[\\u2800-\\u28FF]"],
     // Idle is the session summary plus " - grok", or just "grok" at rest.
     idle: ["^\\s*[^\\s\\u2800-\\u28FF⚠]"],
+    pending: [],
+  },
+  muse: {
+    // Captured off a live Muse Code 1.0.2 PTY: OSC 0 is "⠻ musetest"
+    // while the model runs and "musetest" (the workspace dir basename, bare)
+    // when idle. Same braille-spinner-prefix shape codex and grok emit, so
+    // the same two patterns cover it.
+    busy: ["^\\s*[\\u2800-\\u28FF]"],
+    idle: ["^\\s*[^\\s\\u2800-\\u28FF]"],
+    // NOT measured, and left empty rather than guessed. Triggering muse's
+    // approval prompt needs a real tool call, which needs a Meta account; the
+    // offline `--provider echo` that every other fact here came from never
+    // calls a tool. Patterns written from reasoning are exactly what c35d297
+    // had to replace across every agent, so this waits for a real capture.
+    attention: [],
     pending: [],
   },
   // ── Agents whose titles carry NO state ──────────────────────────────
@@ -961,6 +1002,23 @@ export const UNATTENDED_SPAWN_ARGS: Record<string, string[]> = {
   codex: ["-c", "check_for_update_on_startup=false"],
   // xAI's documented flag for scripted/automated launches.
   grok: ["--no-auto-update"],
+  // Not an update menu: muse's first-run TRUST PICKER, which every worktree
+  // task meets because muse keys trust by DIRECTORY, not by repo (measured:
+  // a `git worktree add` off an already-trusted repo prompts again, where
+  // claude's repo-keyed picker does not). It is the one startup dialog that
+  // `deliverMessage`'s echo guard cannot cover, because the damage is done by
+  // the TEXT and not by the submit the guard withholds: in muse's picker `n`
+  // selects `Quit` and a space CONFIRMS it, so "rename the button" exits the
+  // agent partway through being typed, with no Enter involved. Measured both
+  // ways on a live 1.0.2 ("hello world" and "add a test" survive; "rename the
+  // button" and a bare `n`+space do not).
+  //
+  // `--trust-workspace` is the flag muse ships for this and it trusts for THIS
+  // RUN ONLY, which is what makes it safe here: verified that the same
+  // directory prompts again on the next spawn without the flag, so an
+  // unattended launch cannot leave a workspace permanently trusted behind the
+  // user's back. Attended spawns are untouched and still show the picker.
+  muse: ["--trust-workspace"],
 };
 
 export function spawnArgsForCli(

@@ -84,6 +84,62 @@ Codex is excluded from the ECHO fallback specifically, and only that: its title
 already says `Action Required` at +22ms, so a first message typed into it does
 not need the echo check. It is a full hooks agent otherwise (see below).
 
+**Muse Code cannot use this transport, and that is measured rather than
+assumed.** It has a hooks system and it looks like an easy win: the config is
+claude-shaped, lives at `~/.config/muse/settings.json` (needs
+`"schema_version": 1`, or muse rejects the whole file), and `SessionStart`,
+`UserPromptSubmit`, `Stop`, `PreLLMCall` and `PostLLMCall` all fire, every
+payload carrying `session_id`. Two things kill it, both checked against a live
+1.0.2 through its offline `--provider echo`:
+
+- **Muse strips the environment it hands a hook.** `HOME` survives;
+  `TERMIC_PTY`, `TERMIC_TASK_ID` and an arbitrary probe variable all arrive
+  EMPTY. Every script here opens with `[ -n "$TERMIC_TASK_ID" ] || exit 0` and
+  writes to `$TERMIC_PTY`, so all of them would exit 0 having written nothing,
+  silently. Setting `shell_environment_policy` (`inherit: all`,
+  `include_only: ["TERMIC_.*"]`) does not change it, so that policy governs the
+  agent's own shell tool and not hook commands. The Docker fallbacks do not
+  rescue it either: `/proc/1/fd/1` is Linux-only and `/dev/tty` fails for a hook
+  with no controlling terminal.
+- **`SessionStart` is lazy.** It does not fire at startup; it fires on the FIRST
+  PROMPT. Nothing had arrived 12s into an idle session, and it landed the moment
+  a prompt was submitted. Its own payload says `source: "startup"`, which makes
+  this easy to get backwards. So it could not be the readiness gate that earns
+  claude's `Ready` signal even if the transport worked.
+
+None of which is urgent, because muse is the rare agent whose TITLE already
+carries real state: a braille spinner prefix while the model runs, the bare
+workspace basename when idle, both captured off a live PTY. The title path
+classifies it unaided, and unlike codex it never puts its final message on an
+`OSC 9` (a full capture shows `OSC 0`, `4`, `10` and `11` only), so it has none
+of the end-of-turn bell problem either. What hooks would add is the attention
+state, which is the one thing its title was not measured for.
+
+Wiring it would need a transport muse cannot strip, e.g. baking the pty path
+into the command at install time, which the file-based installer cannot do
+because that path changes per spawn.
+
+**Muse Code is also the case the echo guard cannot cover, and the reason
+`UNATTENDED_SPAWN_ARGS` grew a third entry.** Muse has a trust picker too
+(`Do you trust this workspace?`, options `1 Trust and continue` / `2 Quit`),
+but unlike claude's it is keyed by DIRECTORY rather than by repo, so it is a
+genuinely every-task event: measured, a `git worktree add` off an
+already-trusted repo prompts again. The part that defeats the guard is which
+keys the picker binds. `n` selects `Quit` and a SPACE confirms it, so the
+prompt "rename the button" exits the agent partway through being typed, with
+no Enter involved at all. The guard withholds the submit, which is the wrong
+end: by then the damage is done. Measured both ways on a live 1.0.2, no Enter
+sent in any of them: `hello world` and `add a test` leave the picker up, while
+`rename the button` and a bare `n` then space exit.
+
+So the unattended path passes `--trust-workspace`, muse's own flag for this.
+It trusts for THAT RUN ONLY (verified: the same directory prompts again on the
+next spawn without the flag), so an unattended launch cannot quietly leave a
+workspace trusted afterwards, and an attended spawn still gets the picker and
+answers it itself. A caged task never sees any of this: `isTaskCaged(task) ||
+task.yolo` means it always gets `--yolo`, which trusts the workspace for the
+run as a side effect of dropping approval.
+
 **`PreToolUse` is a heartbeat, not a duplicate.** Working is the only sustained
 state here; every other signal is an edge. The title re-asserted working on
 every repaint, so anything that wrongly cleared the spinner self-healed within

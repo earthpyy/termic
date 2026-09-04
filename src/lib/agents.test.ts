@@ -21,7 +21,7 @@ vi.mock("@/lib/utils", () => ({
   slugify: (s: string) => s.toLowerCase().replace(/\s+/g, "-"),
 }));
 
-import { resumeIdArgsForCli, cliSupportsCaptureResume, spawnArgsForCli, defaultCliFirst, visibleCliIds, cliSupportsIdSession, cliSupportsResumeById, agentDisplayName, decideResume, isTerminalCli, workDoneCapable, terminalLaunchCommand, classifyAgentTitle, compileSignals, BUILTIN_TITLE_SIGNALS, BUILTIN_OUTPUT_SIGNALS, builtinBaseId, YOLO_ARGS_NOTES, resolveAgent, agentOverrides, hasPendingWork, notificationWantsAttention, PENDING_TAIL_ROWS } from "@/lib/agents";
+import { resumeIdArgsForCli, cliSupportsCaptureResume, postLaunchCaptureForCli, spawnArgsForCli, defaultCliFirst, visibleCliIds, cliSupportsIdSession, cliSupportsResumeById, agentDisplayName, decideResume, isTerminalCli, workDoneCapable, terminalLaunchCommand, classifyAgentTitle, compileSignals, BUILTIN_TITLE_SIGNALS, BUILTIN_OUTPUT_SIGNALS, builtinBaseId, YOLO_ARGS_NOTES, resolveAgent, agentOverrides, hasPendingWork, notificationWantsAttention, PENDING_TAIL_ROWS } from "@/lib/agents";
 import type { Agent, CliInfo } from "@/lib/types";
 
 // ── spawnArgsForCli ───────────────────────────────────────────────────
@@ -418,6 +418,82 @@ describe("codex resume", () => {
   it("composes with yolo in the order codex accepts", () => {
     expect(args({ yolo: true, resume: true }))
       .toEqual(["resume", "--last", "--dangerously-bypass-approvals-and-sandbox"]);
+  });
+});
+
+// Muse Code (Meta), GH #275. Every fact below came off a live Muse Code 1.0.2
+// driven through its offline `--provider echo`, so none of it needed a Meta
+// account. The interesting one is that muse is deliberately NOT id-capable:
+// `muse resume <session-uuid>` exists, but the only flag that would MINT an id
+// (`--session-id`) belongs to `muse exec`, and the TUI rejects it outright
+// ("invalid TUI options: unexpected argument '--session-id' found"). So a muse
+// task resumes by cwd like codex, with codex's repo-root caveat.
+describe("muse resume", () => {
+  beforeEach(() => { mockAgents.length = 0; });
+  const args = (o: Parameters<typeof spawnArgsForCli>[1]) => spawnArgsForCli("muse", o);
+
+  it("resumes with the `resume --last` subcommand, not a flag", () => {
+    expect(args({ yolo: false, resume: true })).toEqual(["resume", "--last"]);
+  });
+
+  it("emits `resume --last --yolo`, the order muse was verified to accept", () => {
+    // spawnArgsForCli puts yolo_args AFTER the resume block, so the real
+    // command line has --yolo trailing a subcommand. Checked against the live
+    // binary rather than assumed: it resumed the prior session with history
+    // AND showed YOLO in its footer.
+    expect(args({ yolo: true, resume: true })).toEqual(["resume", "--last", "--yolo"]);
+  });
+
+  it("passes only --yolo on a fresh spawn", () => {
+    expect(args({ yolo: true, resume: false })).toEqual(["--yolo"]);
+  });
+
+  it("spawns bare when neither resume nor yolo is asked for", () => {
+    expect(args({ yolo: false, resume: false })).toEqual([]);
+  });
+
+  it("ignores a sessionUuid entirely, because the TUI cannot be given one", () => {
+    // A uuid on the task must not leak into the command line as some
+    // half-supported flag: muse would reject the whole invocation.
+    expect(cliSupportsIdSession("muse")).toBe(false);
+    // muse CAN resume a specific session; it just cannot be handed the id at
+    // launch, so it is the capture shape (opencode's), not the mint shape.
+    expect(cliSupportsResumeById("muse")).toBe(true);
+    expect(cliSupportsCaptureResume("muse")).toBe(true);
+    expect(args({ yolo: false, resume: true, sessionUuid: "u-1", resumeKnown: true }))
+      .toEqual(["resume", "--last"]);
+    expect(args({ yolo: false, resume: false, sessionUuid: "u-1", resumeKnown: false }))
+      .toEqual([]);
+  });
+
+  it("adds --trust-workspace ONLY on an unattended spawn, before the subcommand", () => {
+    // muse keys trust by directory, so every worktree task meets its trust
+    // picker, and `n` in that picker selects Quit with a space confirming it:
+    // "rename the button" kills the agent while it is still being TYPED, which
+    // is upstream of the echo guard that withholds the submit. The flag trusts
+    // for this run only (verified: the same dir prompts again next spawn), so
+    // an attended launch still gets the picker and answers it itself.
+    expect(args({ yolo: false, resume: false, unattended: true }))
+      .toEqual(["--trust-workspace"]);
+    expect(args({ yolo: false, resume: true, unattended: true }))
+      .toEqual(["--trust-workspace", "resume", "--last"]);
+    expect(args({ yolo: false, resume: true, unattended: false }))
+      .toEqual(["resume", "--last"]);
+  });
+
+  it("captures its session id, because it cannot be handed one", () => {
+    // The opposite of what this asserted at first. muse rejects `--session-id`
+    // on the TUI, so termic cannot mint an id for it; but muse writes its own
+    // under `$XDG_DATA_HOME/muse/sessions/YYYY/MM/DD/<uuid>/`, and
+    // `muse resume <uuid>` replays that conversation (verified on a live 1.0.2
+    // through `--provider echo`: it printed "resumed session <uuid>" and
+    // redrew the prior turns). So the id is read back off disk, exactly the
+    // way opencode's is.
+    const cap = postLaunchCaptureForCli("muse");
+    expect(cap?.command).toContain("muse/sessions");
+    expect(cap?.command).toContain("XDG_DATA_HOME");
+    expect(resumeIdArgsForCli("muse", "01a06b54-a9a0-71d3-bc65-b555ff3699c0"))
+      .toEqual(["resume", "01a06b54-a9a0-71d3-bc65-b555ff3699c0"]);
   });
 });
 
@@ -1043,6 +1119,12 @@ describe("classifyAgentTitle", () => {
       // plan awaiting approval reads as busy forever.
       ["grok", "⠹ - Running: Plan: Exit - Plan Adding Subtract Function to calc.py - grok", "attention"],
 
+      // muse: braille spinner prefix while the model runs, bare workspace
+      // basename when idle. Both captured off a live PTY (OSC 0).
+      ["muse", "musetest", "idle"],
+      ["muse", "⠋ musetest", "busy"],
+      ["muse", "⠹ musetest", "busy"],
+
       // Agents whose titles carry no state at all.
       ["agy", "anything at all", null],
       ["opencode", "OpenCode", null],
@@ -1176,7 +1258,20 @@ describe("BUILTIN_TITLE_SIGNALS", () => {
   // pattern especially: user signals run busy BEFORE idle, so an unqualified
   // "leading non-alphanumeric" busy test would swallow claude's own ✳ done
   // glyph, and every finished turn would read as still working.
-  for (const cli of ["claude", "codex"]) {
+  it("keeps muse's attention list empty until someone captures the real title", () => {
+    // muse's busy/idle titles were measured; its approval-prompt title was
+    // not, because triggering one needs a real tool call and so a Meta
+    // account. A guessed pattern here is worse than none: it would fire on
+    // ordinary turns and badge needs-you forever. c35d297 exists because two
+    // agents shipped reasoned-not-measured patterns.
+    expect(BUILTIN_TITLE_SIGNALS.muse.attention).toEqual([]);
+    expect(BUILTIN_TITLE_SIGNALS.muse.pending).toEqual([]);
+    // But it is NOT one of the signal-silent agents: these two are real.
+    expect(BUILTIN_TITLE_SIGNALS.muse.busy.length).toBeGreaterThan(0);
+    expect(BUILTIN_TITLE_SIGNALS.muse.idle.length).toBeGreaterThan(0);
+  });
+
+  for (const cli of ["claude", "codex", "muse"]) {
     it(`pasting ${cli}'s placeholders back in classifies identically`, () => {
       const pasted = sigAgent(cli, BUILTIN_TITLE_SIGNALS[cli]);
       const titles = [

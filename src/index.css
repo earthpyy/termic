@@ -121,6 +121,10 @@
      bg. Use a light neutral here and the brand black in light mode,
      the same treatment grok and opencode already get. */
   --color-cli-pi:      #e4e4e7;
+  /* Meta blue. The #0064e0 brand value sits at ~3.4:1 on this ground, so
+     the dark theme takes the lighter step of Meta's own blue ramp and light
+     mode gets the brand value back below. */
+  --color-cli-muse:    #4599ff;
 
   --radius-pill: 999px;
   /* Default mono. Overridden at runtime by the font picker (writes the
@@ -222,6 +226,7 @@
     --color-cli-grok:    #64748b;
     --color-cli-opencode: #6b6965;
     --color-cli-pi:      #09090b;
+    --color-cli-muse:    #0064e0;
     /* Palette ramp: the dark-bg defaults (esp. yellow/teal) wash out
        on cream, so shift every hue darker. */
     --color-palette-red:    #c2403f;

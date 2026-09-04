@@ -70,6 +70,21 @@ RUN curl -fsSL https://antigravity.google/cli/install.sh | bash
 # that can put the binary inside ~/.pi, which is also its config dir, and
 # mounting a config dir over its own binary is why grok can never persist.
 RUN npm install -g @earendil-works/pi-coding-agent
+# https://developer.meta.com/ai/resources/blog/build-with-muse-code/ - curl
+# is the only install path Meta publishes (no npm package). The shim lands in
+# ~/.local/bin (already on PATH above) and re-execs a versioned sibling
+# binary next to it, NOT inside ~/.config/muse or ~/.local/share/muse, so
+# mounting those config dirs cannot shadow it the way it would for grok.
+# Costs ~235MB of image: the binary is statically linked and self-contained.
+#
+# NON-FATAL, the same call glab gets above and for a sharper reason. This is
+# the largest and newest install here, it pulls a ~235MB binary from a second
+# host (lookaside.facebook.com) through a launcher that has an HTTP 401 path of
+# its own, and a hard failure here would break EVERY Docker task for everyone,
+# including the people who have never run muse. A missing muse is one agent
+# unavailable in the container; a failed build is all of them.
+RUN curl -fsSL https://dev.meta.ai/install.sh | bash \
+    || echo "WARNING: muse install failed, Muse Code will be missing from this image"
 
 # ── Add your own MCP servers, CLI tools and skills here ────────────────
 # RUN npm install -g @some/mcp-server

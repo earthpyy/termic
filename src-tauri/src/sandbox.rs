@@ -1595,6 +1595,22 @@ pub fn render_filter_for(task: &Task, agent_override: Option<&str>) -> String {
             // rather than opening all of *.run.app.
             r"^antigravity-cli-auto-updater-.+\.run\.app$".into(),
         ]),
+        // Muse Code (Meta). Every host here came out of the shipped launcher
+        // shim and `strings` on the 1.0.2 binary rather than guesswork:
+        // `api.meta.ai` is both the Model API and the release-channel
+        // endpoint, `auth.meta.com` + `accountscenter.meta.com` are the
+        // device-code login flow, `dev.meta.ai` serves install.sh, and
+        // `lookaside.facebook.com` is the launcher's binary download host
+        // (MUSE_DOWNLOAD_HOST) — a blocked self-update is what a stale
+        // version looks like from the outside.
+        "muse" => hosts.extend([
+            r"^api\.meta\.ai$".into(),
+            r"^dev\.meta\.ai$".into(),
+            r"^.+\.meta\.ai$".into(),
+            r"^auth\.meta\.com$".into(),
+            r"^accountscenter\.meta\.com$".into(),
+            r"^lookaside\.facebook\.com$".into(),
+        ]),
         _ => { /* custom agents: user must list hosts explicitly */ }
     }
 
