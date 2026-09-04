@@ -3021,9 +3021,18 @@ describe("agent hooks", () => {
     expect(merged.hooks.Stop[0].hooks[0].command).toBe("/usr/local/bin/my-own-hook");
     expect(merged.model).toBe("opus");
     expect(merged.alwaysThinkingEnabled).toBe(true);
+    // The usage status line lands in the same write (GH #277). It is claimed
+    // only because this fixture leaves the slot empty; a user with their own
+    // status line keeps it, which `merge_statusline`'s Rust tests cover.
+    expect(merged.statusLine.command).toContain("termic-hooks");
+    expect(merged.statusLine.type).toBe("command");
     // Key ORDER survives too: serde_json sorts by default, which silently
-    // rewrites a config the user hand-ordered.
-    expect(Object.keys(merged)).toEqual(["model", "hooks", "alwaysThinkingEnabled"]);
+    // rewrites a config the user hand-ordered. The user's own three keep both
+    // their order and their position, and ours is APPENDED after them rather
+    // than sorted into the middle of a config they hand-wrote.
+    expect(Object.keys(merged)).toEqual([
+      "model", "hooks", "alwaysThinkingEnabled", "statusLine",
+    ]);
 
     // The script is executable, or claude cannot run it and the hook is inert.
     // One script per signal, named for what it reports. claude registers only
@@ -3034,6 +3043,9 @@ describe("agent hooks", () => {
     await browser.execute(async () =>
       await window.__termic!.invoke("agent_hooks_remove", { agentId: "claude" }));
 
+    // Byte for byte, statusLine included: removal has to hand back a slot it
+    // borrowed, or uninstalling leaves a config pointing at a script that is
+    // no longer there.
     expect(readFileSync(settingsPath, "utf8")).toBe(userConfig);
     expect(existsSync(scriptDir)).toBe(false);
     rmSync(`${dataDir}/.claude`, { recursive: true, force: true });
