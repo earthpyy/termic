@@ -401,6 +401,24 @@ export const PENDING_TAIL_ROWS = 8;
  *  one-done-per-submit token so the two can't disagree about which it is. */
 export const STICKY_DONE_MS = 8_000;
 
+/** How long after a needs-you a SECOND needs-you counts as the same prompt
+ *  being reported twice rather than the agent asking again.
+ *
+ *  One permission prompt marks attention twice, measured: termic's own hook
+ *  fires the instant claude blocks, and claude's `OSC 9` ("Claude needs your
+ *  permission") arrives a further 6.0s behind it. Both are correct; only the
+ *  first is news, and the second must not raise a banner for a prompt the user
+ *  has already been shown (GH #276).
+ *
+ *  It has to be a WINDOW rather than "an attention mark is already held", which
+ *  was the first shape and had a hole worth remembering: a permission prompt is
+ *  answered with a BARE KEY (`y`), and only Enter clears the mark, so a
+ *  state-only test called the next genuine needs-you a repeat of one the user
+ *  had already dealt with and went silent on it. 10s covers the observed echo
+ *  with room; a genuine re-ask inside it can only happen with the user at the
+ *  keyboard, where the focus gate suppresses the banner anyway. */
+export const ATTENTION_ECHO_MS = 10_000;
+
 /** True when the agent's own UI says it has work outstanding, so a "done" now
  *  would be a lie. `rows` is the visible buffer, top to bottom; only the last
  *  PENDING_TAIL_ROWS are considered.
@@ -553,6 +571,7 @@ export const BUILTIN_NOTIFY_IGNORE: Record<string, string[]> = {
 export const BUILTIN_NOTIFY_ATTENTION: Record<string, string[]> = {
   claude: ["needs your", "needs permission"],
 };
+
 
 /** Whether a notification body should raise attention. Defaults to `true` for
  *  unknown agents and unknown bodies: an agent that explicitly asked the

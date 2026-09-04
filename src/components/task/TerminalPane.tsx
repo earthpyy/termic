@@ -46,7 +46,7 @@ import * as ipc from "@/lib/ipc";
 import { maybeRebuildDockerImageForLaunch } from "@/lib/dockerDailyRebuild";
 import { loginShell, loginShellArgs } from "@/lib/loginShell";
 import { usePrefs, currentTerminalStack, currentTerminalTheme, currentColorFgBg, currentMinimumContrastRatio } from "@/store/prefs";
-import { spawnArgsForCli, spawnCommandForCli, tryToggleYoloLive, envForCli, agentDisplayName, cliSupportsIdSession, cliSupportsCaptureResume, postLaunchCaptureForCli, decideResume, resumeIdArgsForCli, workDoneCapable, terminalLaunchCommand, isTerminalCli, classifyAgentTitle, compileSignals, hasPendingWork, notificationWantsAttention, PENDING_TAIL_ROWS, STICKY_DONE_MS, builtinBaseId, BUILTIN_OUTPUT_SIGNALS, resolveAgent } from "@/lib/agents";
+import { spawnArgsForCli, spawnCommandForCli, tryToggleYoloLive, envForCli, agentDisplayName, cliSupportsIdSession, cliSupportsCaptureResume, postLaunchCaptureForCli, decideResume, resumeIdArgsForCli, workDoneCapable, terminalLaunchCommand, isTerminalCli, classifyAgentTitle, compileSignals, hasPendingWork, notificationWantsAttention, PENDING_TAIL_ROWS, STICKY_DONE_MS, ATTENTION_ECHO_MS, builtinBaseId, BUILTIN_OUTPUT_SIGNALS, resolveAgent } from "@/lib/agents";
 import { recordTitle, noteSubmit, noteDone } from "@/lib/agentSignalLog";
 import { MessageQueueButton } from "./MessageQueueButton";
 import { ReviewCommentsBar } from "./ReviewCommentsBar";
@@ -380,6 +380,33 @@ export function TerminalPane({ task, tab, active }: Props) {
   // without that the turn's REAL completion is dropped as "already fired this
   // turn" and a long multi-stage turn ends in silence.
   const doneFiredAtRef = useRef(0);
+  // Has the user ALREADY been interrupted about this turn finishing?
+  //
+  // Deliberately NOT `doneFiredSinceSubmitRef`, which is a state token and is
+  // handed back twice on purpose: `goWorking` reopens it after
+  // STICKY_DONE_MS so a premature done cannot swallow the turn's real
+  // completion, and a hook done bypasses it outright so the agent's own
+  // statement always ends the turn. Both are right for the spinner and both
+  // silently restored the right to NOTIFY, which is how one turn came to cost
+  // one banner per stage boundary (GH #276). Long agentic turns have many.
+  //
+  // So the latch is keyed on the ONE value every send path already stamps:
+  // `lastInputAt`. Keyboard Enter, the message queue, a broadcast, `seedPrompt`,
+  // `runPrompt`, `sendComments` and the CLI/deep-link path all patch it, so
+  // "the turn moved on" needs no reset hook of its own and cannot be missed by
+  // a path added later. Nothing the AGENT does touches it, which is the point:
+  // a turn the user has been told about stays told about however many stages it
+  // goes on to have.
+  //
+  // `-1` is the fresh-PTY value, chosen because no timestamp can equal it: a
+  // respawn keeps the tab's old `lastInputAt`, so a plain reset-to-0 would have
+  // matched a turn already announced and swallowed the first real completion
+  // after a restart.
+  const announcedForInputAtRef = useRef(-1);
+  // When this tab last marked a needs-you that was NOT itself an echo. Bounds
+  // the window in which a second attention mark is the same prompt being
+  // reported twice rather than the agent asking again. See `goAttention`.
+  const attnMarkedAtRef = useRef(0);
   // Newest OSC title seen on this tab. fireDone hands it to a signal capture as
   // the "resting" title. A ref, not state, so the spinner's ~10/s repaint can
   // never re-render the terminal.
@@ -504,7 +531,20 @@ const captureArmedRef = useRef(false);
     }
     debugLogRef.current?.("state→done", reason);
     app.setWorkState(task.id, tab.id, "done");
-    app.markAttention(task.id, tab.id, attn);
+    // The dot is marked either way; `repeat` decides whether it also
+    // interrupts. See the ref's comment and lib/attentionNotify.ts (GH #276).
+    const turnKey = (useApp.getState().tabs[task.id]
+      ?.find(t => t.id === tab.id) as TerminalTab | undefined)?.lastInputAt ?? 0;
+    const repeat = attn === "done" && announcedForInputAtRef.current === turnKey;
+    if (repeat) {
+      debugLogRef.current?.("done-repeat", `badge only, already announced (${reason})`);
+      logWorkState("done-repeat",
+        `cli=${tab.cli} task=${JSON.stringify(task.name)} why=${reason}`
+        + ` turn=${turnKey} badge marked, banner suppressed (already announced this turn)`);
+    } else if (attn === "done") {
+      announcedForInputAtRef.current = turnKey;
+    }
+    app.markAttention(task.id, tab.id, attn, undefined, repeat);
     // End of a turn: the title standing right now is the idle candidate for a
     // signal capture. No-op unless one is recording for this agent.
     noteDone(tab.cli, lastTitleRef.current);
@@ -1232,6 +1272,10 @@ const captureArmedRef = useRef(false);
     captureArmedRef.current = false;
     // Fresh PTY → no done has fired yet for the (eventual) first submit.
     doneFiredSinceSubmitRef.current = false;
+    // ...and nothing has been announced for it either. A respawn is a new turn
+    // by definition, so the user is owed the first completion after it - which
+    // is why this is -1 and not 0 (the tab keeps its old `lastInputAt`).
+    announcedForInputAtRef.current = -1;
     // Reset workState for this (re)spawn — stale "done" from a prior
     // PTY (or pre-Restart session) would otherwise show a bullet for a
     // freshly-spawned agent.
@@ -1332,7 +1376,42 @@ const captureArmedRef = useRef(false);
       // via the unread channel.
       dbg("state→attention", reason);
       setWorkState(task.id, tab.id, "done", `attention: ${reason}`);
-      markAttention(task.id, tab.id, "attention", message);
+      // One needs-you, one banner, and the badge agrees with what the banner
+      // said (GH #276).
+      //
+      // A single permission prompt marks attention TWICE, measured: termic's
+      // hook fires the moment claude blocks, and claude's own OSC 9 arrives
+      // 6.0s behind it. The second one was silent only by accident, because the
+      // rising edge was already spent - if anything had cleared `unread` in
+      // between, the user got two banners for one prompt. `repeat` makes it
+      // deliberate.
+      //
+      // And the FIRST wording wins rather than the last. The hook names the
+      // tool it is blocked on ("needs your permission: Bash", see
+      // agent_hooks.rs); claude's own later body does not, so letting it
+      // overwrite would leave the badge less specific than the banner the user
+      // already read, and disagreeing with it.
+      // Bounded in TIME, not by "an attention mark is already held", which was
+      // the first attempt and had a hole: a permission prompt is answered with a
+      // BARE KEY (`y`), and only `\r` clears the mark. So a state-only test
+      // would treat the next genuine needs-you, minutes later, as a repeat of
+      // one the user had already dealt with, and go silent on it.
+      //
+      // ATTENTION_ECHO_MS is the measured 6.0s gap plus room: inside it the two
+      // marks are one prompt being reported twice, outside it the agent is
+      // asking again and that is news. A re-ask INSIDE the window can only
+      // happen with the user at the keyboard, where `isUserWatching` suppresses
+      // the banner anyway.
+      const held = (useApp.getState().tabs[task.id]
+        ?.find(t => t.id === tab.id) as TerminalTab | undefined)?.unread;
+      const already = held?.reason === "attention"
+        && Date.now() - attnMarkedAtRef.current < ATTENTION_ECHO_MS;
+      if (!already) attnMarkedAtRef.current = Date.now();
+      markAttention(
+        task.id, tab.id, "attention",
+        (already && held?.message) ? held.message : message,
+        already,
+      );
       // The turn reached a terminal state (waiting on the user). Spend the
       // one-done-per-submit token so a trailing settle/OSC 9 can't stack a
       // blue done dot on top of the attention until the user responds.

@@ -837,6 +837,198 @@ describe("a premature done is taken back", () => {
   });
 });
 
+// P0 (GH #276): one turn is allowed to interrupt the user ONCE.
+//
+// The two cases below are the same bug reached down two different code paths,
+// and neither existed until a user reported "notifications for what seems like
+// every action". The mechanism is a loop between three places that are each
+// individually right:
+//
+//   1. a done fires  -> markAttention("done") -> the tab's `unread` goes from
+//      null to set, and that RISING EDGE is exactly what useAttentionNotifier
+//      turns into an OS banner.
+//   2. the agent goes back to work -> setWorkState("working") in store/app.ts
+//      CLEARS that unread, deliberately: leaving "this finished" on a visibly
+//      working tab would be a lie.
+//   3. the turn ends again -> another rising edge -> another banner.
+//
+// So every premature done in a long turn costs one notification, and a long
+// agentic turn has many. The notifier's own 8s debounce is no defence at all
+// against a turn measured in minutes.
+//
+// Counted on the rising edge rather than on `notify()` itself on purpose: the
+// notifier imports `notify` as a live ESM binding, so there is nothing a spec
+// can hook, and the edge is what it consumes one-for-one anyway (its only
+// other gates are the focus check, which `setWindowPresence(false)` settles,
+// and the debounce this is about).
+describe("one turn raises one notification", () => {
+  const ids: string[] = [];
+  after(async () => {
+    for (const id of ids) await archiveTask(id);
+  });
+
+  /** Count what the notifier consumes, and separately what the sidebar shows.
+   *
+   *  The OS banner itself is NOT the observable here, and that was measured
+   *  rather than assumed: `ipc.notify` bails at `ensureNotifyPermission()`
+   *  before it ever reaches the plugin, so an e2e binary asks the OS for
+   *  nothing and a count of notification commands reads 0 both before and after
+   *  the fix. The `__TAURI_INTERNALS__.invoke` wrapper below is kept anyway,
+   *  because it is the only hook a page HAS (`notify` is a live ESM binding)
+   *  and a run with permission granted gets the count for free. It is reported,
+   *  never asserted.
+   *
+   *  So the assertion is on the newsworthy rising edge: the last decision
+   *  before `notify()`, mapping to banners one-for-one. */
+  const armCounters = (taskId: string) =>
+    browser.execute((id) => {
+      const w = window as unknown as {
+        __notifyCount?: number;
+        __notifyCmds?: string[];
+        __unreadEdges?: number;
+        __newsEdges?: number;
+        __unreadStop?: () => void;
+        __invokeRestore?: () => void;
+        __TAURI_INTERNALS__?: { invoke: (...a: unknown[]) => unknown };
+      };
+      w.__unreadStop?.();
+      w.__invokeRestore?.();
+      w.__notifyCount = 0;
+      w.__notifyCmds = [];
+      w.__unreadEdges = 0;
+      w.__newsEdges = 0;
+
+      const internals = w.__TAURI_INTERNALS__;
+      if (internals) {
+        const original = internals.invoke;
+        internals.invoke = (...args: unknown[]) => {
+          const cmd = String(args[0] ?? "");
+          if (/notif/i.test(cmd)) {
+            w.__notifyCount = (w.__notifyCount ?? 0) + 1;
+            w.__notifyCmds!.push(cmd);
+          }
+          return original.apply(internals, args as never);
+        };
+        w.__invokeRestore = () => { internals.invoke = original; };
+      }
+
+      // Two counts, because the fix has to move one and not the other:
+      //   edges  - every null -> set transition. This is the sidebar dot, and
+      //            a long turn is SUPPOSED to produce several.
+      //   news   - the same transitions measured on newsworthiness rather than
+      //            truthiness, which is exactly what useAttentionNotifier
+      //            turns into a banner (lib/attentionNotify.ts).
+      // Both maps start empty, so a first mark is itself an edge.
+      const seen = new Map<string, boolean>();
+      const seenNews = new Map<string, boolean>();
+      w.__unreadStop = window.__termic!.useApp.subscribe((s: { tabs: Record<string, Array<{ id: string; unread?: { repeat?: boolean } | null }>> }) => {
+        for (const tab of s.tabs[id] ?? []) {
+          const now = !!tab.unread;
+          if (now && !(seen.get(tab.id) ?? false)) w.__unreadEdges = (w.__unreadEdges ?? 0) + 1;
+          seen.set(tab.id, now);
+          const news = !!tab.unread && tab.unread.repeat !== true;
+          if (news && !(seenNews.get(tab.id) ?? false)) w.__newsEdges = (w.__newsEdges ?? 0) + 1;
+          seenNews.set(tab.id, news);
+        }
+      });
+    }, taskId);
+
+  const readCounters = () =>
+    browser.execute(() => {
+      const w = window as unknown as {
+        __notifyCount?: number; __notifyCmds?: string[];
+        __unreadEdges?: number; __newsEdges?: number;
+      };
+      return {
+        banners: w.__notifyCount ?? 0,
+        cmds: w.__notifyCmds ?? [],
+        edges: w.__unreadEdges ?? 0,
+        news: w.__newsEdges ?? 0,
+      };
+    }) as Promise<{ banners: number; cmds: string[]; edges: number; news: number }>;
+
+  const disarm = () =>
+    browser.execute(() => {
+      const w = window as unknown as {
+        __unreadStop?: () => void; __invokeRestore?: () => void;
+      };
+      w.__unreadStop?.();
+      w.__invokeRestore?.();
+      w.__unreadStop = undefined;
+      w.__invokeRestore = undefined;
+    });
+
+  /** Both drills are a two-stage turn: work, look finished, work, finish. */
+  const runTwoStageTurn = async (name: string, directive: string) => {
+    const taskId = await openTask(name);
+    ids.push(taskId);
+    await waitForAgentReady(taskId);
+    // Away: a done on a watched tab is downgraded to idle on the spot and
+    // never badges, so the bug is only reachable with nobody looking. That is
+    // also the reporter's repro ("run a task and unfocus the application").
+    await setWindowPresence(false);
+    await armCounters(taskId);
+    await submitToAgent(taskId, directive);
+
+    // Stage 1's premature done, then stage 2 taking it back, then the real
+    // ending. Waiting through all three is what proves the counter saw the
+    // whole turn rather than stopping at the first badge.
+    await browser.waitUntil(async () => (await sidebarBadge(taskId)) === "done", {
+      timeout: 25_000, interval: 300,
+      timeoutMsg: "the premature done never badged; the drill did not run",
+    });
+    await browser.waitUntil(async () => (await sidebarBadge(taskId)) === "working", {
+      timeout: 25_000, interval: 300,
+      timeoutMsg: "the agent never went back to work; the drill did not run",
+    });
+    await browser.waitUntil(async () => {
+      const b = await sidebarBadge(taskId);
+      return b === "done" || b === "attention";
+    }, {
+      timeout: 25_000, interval: 300,
+      timeoutMsg: "the real completion badged nothing",
+    });
+    const counters = await readCounters();
+    await disarm();
+    await setWindowPresence(true);
+    return counters;
+  };
+
+  // The heuristic path: no hooks, the title and the settle timers own the
+  // turn. This is codex's ONLY path (it is not in agent_hooks SUPPORTED), and
+  // claude's whenever its hooks are off.
+  it("does not re-notify when a heuristic done is taken back and re-fired", async function () {
+    this.timeout(120_000);
+    await waitForAppShell();
+    await requireTermicApi();
+    await requireWorkBadges();
+    const { edges, news } = await runTwoStageTurn("e2e-notify-once-title", "#stage");
+    // 2 before the fix: one banner per stage boundary.
+    expect(news).toBe(1);
+    // ...while the dot still tracks BOTH boundaries. A fix that suppressed the
+    // edge would have taken the sidebar marker with it, which is why this is
+    // asserted rather than left to whatever the fix happened to do.
+    expect(edges).toBe(2);
+    await snap("agent-notify-once-title.png");
+  });
+
+  // The hook path, which needed its own case because it does not share a
+  // single guard with the one above: a 133;D calls fireDone with `fromHook`,
+  // which skips the one-done-per-submit token entirely. A captured
+  // termic-workstate.log from real claude use shows `CDCDCDCDCD` on ordinary
+  // tasks, so this is the common shape, not an exotic one.
+  it("does not re-notify when a HOOK reports two dones in one turn", async function () {
+    this.timeout(120_000);
+    await waitForAppShell();
+    await requireTermicApi();
+    await requireWorkBadges();
+    const { edges, news } = await runTwoStageTurn("e2e-notify-once-hook", "#hookstage");
+    expect(news).toBe(1);
+    expect(edges).toBe(2);
+    await snap("agent-notify-once-hook.png");
+  });
+});
+
 // P0: an agent asking for the user must raise ATTENTION, not "done". Claude
 // sends this ~6s after its title goes idle, i.e. always just behind our own
 // done paths, so attention has to be able to land on top of a done we already

@@ -62,6 +62,12 @@ set_title "✳ ${name}"
 #               spent on the wrong one). The sleep is long enough to clear
 #               STICKY_DONE_MS counted from when the done actually fires, not
 #               from when the stage ends.
+#   #hookstage  the same two-stage turn as #stage, but reported over the HOOK
+#               transport (OSC 133;C/;D) rather than the title. A 133;D
+#               reaches fireDone with `fromHook`, which bypasses the
+#               one-done-per-submit token, so this is the path #stage cannot
+#               cover. Real claude with shell integration emits this shape all
+#               day (GH #276).
 #   #osc9 TEXT  emit an OSC 9 notification with a verbatim body, the way claude
 #               asks for the user. BEL-terminated, as claude sends it.
 #   #bel        emit a REAL bell, distinct from the BEL that terminates an OSC.
@@ -123,6 +129,31 @@ while IFS= read -r line; do
       echo "FAKE-AGENT stage 2 landed"
       sleep 2
       set_title "✳ ${name}"              # finished for real this time
+      continue ;;
+    "#hookstage")
+      # The SAME two-stage turn as #stage, but reported over the HOOK
+      # transport (OSC 133;C/;D) instead of the title. It exists because the
+      # two paths reach `fireDone` with opposite guards and only one of them
+      # was ever covered: a 133;D calls it with `fromHook`, which bypasses the
+      # one-done-per-submit token outright, so nothing at all stood between a
+      # multi-command turn and one notification per command. Real claude with
+      # shell integration emits exactly this shape - a captured
+      # `termic-workstate.log` shows `CDCDCDCDCD` on ordinary tasks (GH #276).
+      #
+      # No title is painted here, deliberately. Mixing the two would let the
+      # title path account for a transition the hook path was supposed to
+      # prove, which is how the hook half stayed untested in the first place.
+      osc133 "C"
+      echo "FAKE-AGENT hook stage 1 working"
+      sleep 1
+      osc133 "D"                         # turn "ends" - badge #1
+      echo "FAKE-AGENT hook stage 1 landed"
+      sleep 16                           # clear STICKY_DONE_MS from the done
+      osc133 "C"                         # back to work, which clears the badge
+      echo "FAKE-AGENT hook stage 2 working"
+      sleep 1
+      osc133 "D"                         # ends for real - badge #2 today
+      echo "FAKE-AGENT hook stage 2 landed"
       continue ;;
     "#osc9 "*)
       osc9 "${line#\#osc9 }"

@@ -351,7 +351,11 @@ export interface AppState {
   /** `message` is the agent's own words (an OSC 9/777 body). When present it
    *  becomes the OS notification body instead of the generic phrasing, which
    *  is what lets the terminal stop forwarding its own duplicate banner. */
-  markAttention: (taskId: string, tabId: string, reason: "bell" | "idle" | "exit" | "done" | "attention", message?: string) => void;
+  /** `repeat` marks a re-assertion of something the user was already told
+   *  about this turn: the dot still updates, the OS banner does not. Only the
+   *  caller knows where the turn began, so only the caller can set it. See
+   *  `Tab.unread.repeat` and lib/attentionNotify.ts (GH #276). */
+  markAttention: (taskId: string, tabId: string, reason: "bell" | "idle" | "exit" | "done" | "attention", message?: string, repeat?: boolean) => void;
   clearAttention: (taskId: string, tabId: string) => void;
   /** Per-tab work-progress state. Idempotent — writing the same value is
    *  a no-op so we don't churn React for every OSC 9;4 the agent emits. */
@@ -2436,7 +2440,7 @@ export const useApp = create<AppState>((set, get) => ({
     return { tabs: { ...s.tabs, [taskId]: next } };
   }),
 
-  markAttention: (taskId, tabId, reason, message) => set(s => {
+  markAttention: (taskId, tabId, reason, message, repeat) => set(s => {
     // Always mark — iTerm2 shows the bullet/bell even on the focused
     // tab so users have a clear "yes, this turn really finished"
     // confirmation. OS notification suppression for the focused
@@ -2444,8 +2448,18 @@ export const useApp = create<AppState>((set, get) => ({
     // here. Indicator clears on user input (term.onData) — never on
     // tab view.
     const list = s.tabs[taskId] || [];
+    // `repeat` is only ever written as `true`: an absent flag means news, so
+    // spreading `repeat: false` into every record would be noise on disk and
+    // in every test snapshot for no behavioural difference.
     const next = list.map(t => t.id === tabId
-      ? { ...t, unread: message ? { reason, message } : { reason } } as Tab
+      ? {
+          ...t,
+          unread: {
+            reason,
+            ...(message ? { message } : null),
+            ...(repeat ? { repeat: true } : null),
+          },
+        } as Tab
       : t);
     return { tabs: { ...s.tabs, [taskId]: next } };
   }),

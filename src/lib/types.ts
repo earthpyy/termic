@@ -1138,6 +1138,22 @@ export interface BaseTab {
      *  forwarding the body directly from the terminal AND marking unread,
      *  which fires two banners for one event. */
     message?: string;
+    /** True when this is a RE-ASSERTION of something the user was already
+     *  told about in the same turn, rather than news.
+     *
+     *  It exists because a long turn legitimately produces several dones. A
+     *  premature done is taken back when the agent goes back to work (the
+     *  `working` branch of `setWorkState` clears a `done` unread on purpose,
+     *  since leaving "this finished" on a visibly working tab would be a lie),
+     *  and the turn's real ending then sets it again. Both marks are correct
+     *  for the SIDEBAR DOT and only the first is news for the OS banner, which
+     *  is the distinction this flag carries. Without it every stage boundary in
+     *  a long turn cost one notification (GH #276).
+     *
+     *  Set by the producer, not the notifier, because only the producer knows
+     *  where the turn began: `TerminalPane` resets its latch on a real submit.
+     *  Missing = news, so nothing that predates this flag goes quiet. */
+    repeat?: boolean;
   } | null;
   /** Only meaningful for `edit` tabs: true when the editor buffer has
    *  unsaved changes. Drives the dirty-dot on the tab and the

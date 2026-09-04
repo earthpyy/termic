@@ -96,6 +96,59 @@ it silently risks blocking the tool.
 **Done and attention get no heartbeat.** A turn ends once, and repeating it
 would re-badge something the user just dismissed. There is a test saying so.
 
+## claude's attention body names the tool, because that body is the one you read
+
+The hook wins the race and therefore composes the banner. Measured: it fires the
+instant claude blocks, and claude's own `OSC 9` ("Claude needs your permission")
+arrives a further **6.0s** behind it, by which point the notification has been
+delivered and cannot be edited. Raising a second one for the same prompt is the
+GH #276 bug, so the agent's own wording only ever reaches the badge.
+
+So the hook says the more useful thing, since it knows something claude's own
+notification does not mention: which tool is being asked about. The body is
+`needs your permission: Bash`, or `needs your permission: mcp__github__create_pr`,
+which is the case that earns the feature (a bare "needs your permission" tells
+you nothing when six MCP servers could be asking).
+
+`tool_name` is claude's documented field for the tool events, `PermissionRequest`
+included, read out of 2.1.259's own embedded hooks reference (`session_id`,
+`tool_name`, `tool_input`). The script extracts the FIRST occurrence, the
+opposite of the Done guard's `##`, because that serialisation order puts the real
+field ahead of `tool_input`. Still no `jq`, and still exit 0 on every path: a
+payload it cannot read falls back to the generic `HOOK_OSC_BODY`.
+
+Two guards, both pinned by tests that RUN the generated script rather than
+grep it:
+
+- **A tool name must be a bare identifier or it is rejected outright**, not
+  sanitised. The body sits in OSC 777's LAST field, so an injected `;` would
+  re-point the earlier fields, and a body of `termic;...` landing in the title
+  position is exactly how a payload would forge a trusted signal.
+- **The body goes through `printf`'s `%s`, never into its format string.** A `%`
+  cannot reach a format specifier even if a future tool name gets past the
+  identifier check.
+
+One surprise worth knowing before you debug it: whitespace inside a tool name is
+not rejected, it is deleted, because the payload is flattened with
+`tr -d '[:space:]'` first (the same step the Done guard uses). `Bash Write` reads
+as `BashWrite`. Harmless, since the extraction stops at the closing quote and can
+never produce a field separator, and asserted so nobody has to work it out twice.
+
+**The badge keeps the FIRST wording, not the last.** claude's later `OSC 9` marks
+attention again, and letting it overwrite would leave the badge vaguer than the
+banner the user already read, and disagreeing with it. That second mark is also
+flagged `repeat` (see `Tab.unread.repeat`), so its silence is deliberate rather
+than an accident of the rising edge being spent: without the flag, anything that
+cleared `unread` between the two marks produced two banners for one prompt.
+
+The echo is bounded by TIME (`ATTENTION_ECHO_MS`, 10s), not by "a needs-you mark
+is already held". That was the first shape and it had a hole worth not
+rediscovering: a permission prompt is answered with a BARE KEY (`y`), and only
+Enter clears the mark, so the state test stayed true long after the user had
+dealt with the prompt and went silent on the NEXT genuine needs-you. A re-ask
+inside the window can only happen with the user at the keyboard, where the focus
+gate suppresses the banner anyway.
+
 ## agy has no attention event, so it is read from the screen
 
 Measured against Antigravity CLI 1.1.24 at a live permission prompt: **no

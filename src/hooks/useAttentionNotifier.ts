@@ -14,6 +14,7 @@ import { notify, onNotifyClick } from "@/lib/ipc";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { TerminalTab } from "@/lib/types";
 import { taskLabel } from "@/lib/taskLabel";
+import { shouldNotifyUnread, UNREAD_PHRASE } from "@/lib/attentionNotify";
 
 const DEBOUNCE_MS = 8000;
 
@@ -35,9 +36,13 @@ export function useAttentionNotifier() {
           // Stopping one intentionally (including Spotlight handoff) should
           // never produce the generic "agent exited" OS notification.
           if (t.type === "terminal" && !!(t as TerminalTab).runTab) continue;
-          if (!t.unread) continue;
-          const wasUnread = prevTabs.find(p => p.id === t.id)?.unread;
-          if (wasUnread) continue;
+          // News, not truthiness. A `repeat` mark is the same turn's done
+          // being re-asserted after the agent went back to work and took the
+          // first one back, which is right for the sidebar dot and is not a
+          // second thing to interrupt the user about (GH #276). It also must
+          // not swallow the edge for a genuine needs-you that lands on top of
+          // it - see lib/attentionNotify.ts for why that half matters.
+          if (!shouldNotifyUnread(t, prevTabs.find(p => p.id === t.id))) continue;
           // Suppress notifications for ANY tab in the focused task —
           // even hidden tabs within it. The user explicitly asked for "never
           // watch and notify for work done" while focused on a task.
@@ -52,12 +57,7 @@ export function useAttentionNotifier() {
           lastFiredRef.current[key] = now;
           const w = state.tasks.find(w => w.id === taskId);
           const proj = w ? state.projects.find(p => p.id === w.project_id) : undefined;
-          const reason =
-            t.unread.reason === "bell" ? "wants input"
-            : t.unread.reason === "exit" ? "exited"
-            : t.unread.reason === "done" ? "finished"
-            : t.unread.reason === "attention" ? "needs your input"
-            : "is idle";
+          const reason = UNREAD_PHRASE[t.unread!.reason] ?? "is idle";
           // Title = "project · task". The terminal/cli name was
           // noise — the body already says what happened.
           // The task half is whatever the sidebar calls it, so a banner
@@ -72,9 +72,9 @@ export function useAttentionNotifier() {
           // which meant two banners for one event.
           notify(
             title,
-            t.unread.message?.trim() || `agent ${reason}`,
+            t.unread!.message?.trim() || `agent ${reason}`,
             { taskId, tabId: t.id },
-            { sound: t.unread.reason === "done" },
+            { sound: t.unread!.reason === "done" },
           ).catch(() => {});
         }
       }

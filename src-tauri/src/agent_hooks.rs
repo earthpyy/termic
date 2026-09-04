@@ -55,7 +55,21 @@ use std::path::{Path, PathBuf};
 // made every later `Stop` look like outstanding work and the tab span forever
 // with no demoter left to correct it. A v4 install is not stale-and-quieter, it
 // is a tab that never stops loading, which is the same severity as v3 in Docker.
-pub const SCHEMA_VERSION: u32 = 5;
+// v6 changes two script BODIES, which an upgrade alone would not pick up: an
+// install writes the scripts once and nothing rewrites them afterwards, so a v5
+// install keeps reporting exactly what v5 reported. Both changes matter enough
+// to be worth a reinstall. claude's and codex's ATTENTION scripts now read
+// `tool_name` out of the payload, so the banner names the tool it is blocked on
+// rather than saying "agent needs your input"; and codex's READY script now also
+// reports the session id, which is the only way a repo-root codex task can
+// resume its OWN conversation instead of whichever one ran last in that
+// directory.
+//
+// Safe to bump for an existing codex install: the trust entries in config.toml
+// hash the hooks.json ENTRY (command path, timeout, status message), none of
+// which this changes, so a reinstall re-asks codex and writes back the same
+// hashes rather than orphaning them.
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// Directory we create inside the agent's config dir. Also the prefix that
 /// identifies our entries for removal, which is why it must never be renamed
@@ -161,14 +175,31 @@ pub enum Signal {
     Ready,
 }
 
+/// OSC 777 `notify` up to and including the sender field. `termic` in the title
+/// position is what marks a signal as OURS rather than something the agent chose
+/// to say, which is what lets it skip `notificationWantsAttention`'s allow-list
+/// (see `lib/agentHooks.ts`).
+const NOTIFY_PREFIX: &str = "777;notify;termic;";
+
+/// The generic attention body. Split out from the payload because claude's
+/// script composes its body at RUN time and needs this exact string as its
+/// fallback: two copies of it would be two things to keep in step.
+/// KEEP IN SYNC with `HOOK_OSC_BODY` in `lib/agentHooks.ts`.
+const ATTENTION_BODY: &str = "agent needs your input";
+
+/// KEEP IN SYNC with `HOOK_OSC_READY_BODY` in `lib/agentHooks.ts`. Must never be
+/// a prefix of `ATTENTION_BODY` or vice versa: the TS handler routes the two
+/// apart on an exact match and would badge a ready session as needing you.
+const READY_BODY: &str = "agent ready for input";
+
 impl Signal {
     /// The OSC payload, without introducer or terminator.
-    fn payload(self) -> &'static str {
+    fn payload(self) -> String {
         match self {
-            Signal::Attention => "777;notify;termic;agent needs your input",
-            Signal::Working => "133;C",
-            Signal::Done => "133;D",
-            Signal::Ready => "777;notify;termic;agent ready for input",
+            Signal::Attention => format!("{NOTIFY_PREFIX}{ATTENTION_BODY}"),
+            Signal::Working => "133;C".into(),
+            Signal::Done => "133;D".into(),
+            Signal::Ready => format!("{NOTIFY_PREFIX}{READY_BODY}"),
         }
     }
     /// Filename stem for the generated script, so one agent's scripts do not
@@ -416,6 +447,44 @@ pub fn script_body(agent: &str, sig: Signal) -> String {
             "  *'\"fullyIdle\":false'*) exit 0 ;;\n",
             "esac\n",
         ),
+        // Name the tool in the ATTENTION body, because this hook is the signal
+        // that actually reaches the user.
+        //
+        // Measured order (GH #276): the hook fires the instant claude blocks,
+        // and claude's own OSC 9 ("Claude needs your permission") arrives a
+        // further 6.0s behind it. The banner is therefore always composed from
+        // the hook's body, and claude's better wording only ever reaches the
+        // badge - it cannot re-notify, and must not, since that would be two
+        // banners for one prompt. So the fix is to make the body that WINS the
+        // race the informative one, and the hook can be more specific than
+        // claude is: it knows which tool is being asked about.
+        //
+        // `tool_name` is claude's documented field for the tool events
+        // (PermissionRequest included), read out of 2.1.259's own embedded
+        // hooks reference: "session_id", "tool_name", "tool_input". FIRST
+        // occurrence, not last, because that serialisation order puts the real
+        // field before `tool_input` - the opposite of the Done guard above,
+        // which needs the last one for the opposite reason.
+        //
+        // Still no jq, same as everything else here. And still exits 0 on
+        // every path: an unparseable payload falls back to the generic body
+        // rather than emitting nothing.
+        ("claude", Signal::Attention) => concat!(
+            "flat=$(cat | tr -d '[:space:]')\n",
+            "tool=''\n",
+            "case \"$flat\" in\n",
+            "  *'\"tool_name\":\"'*)\n",
+            "    tool=${flat#*'\"tool_name\":\"'}\n",
+            "    tool=${tool%%'\"'*}\n",
+            "    ;;\n",
+            "esac\n",
+            "# A tool name is a bare identifier (Bash, Write, mcp__srv__tool).\n",
+            "# Anything else is not one, and a ';' would split the OSC 777\n",
+            "# payload into the wrong fields, so reject rather than sanitise.\n",
+            "case \"$tool\" in\n",
+            "  ''|*[!A-Za-z0-9_-]*) tool='' ;;\n",
+            "esac\n",
+        ),
         _ => "",
     };
 
@@ -439,11 +508,33 @@ pub fn script_body(agent: &str, sig: Signal) -> String {
     //
     // Chained on redirection failure, not on a readiness test: `[ -w /dev/tty ]`
     // is true even where opening it fails, so trying the write IS the test.
-    let emit = format!(
-        "[ -n \"$TERMIC_PTY\" ] || exit 0\n\
-         emit() {{ printf '\\033]{payload}\\007' > \"$1\" 2>/dev/null; }}\n\
-         emit \"$TERMIC_PTY\" || emit /proc/1/fd/1 || emit /dev/tty || true"
-    );
+    // claude's attention body is composed at RUN time from `$tool` (set by the
+    // guard above), so its payload cannot be a compile-time literal like every
+    // other one. Two things about the shape are load-bearing:
+    //
+    //   - the body goes through `%s`, never into printf's FORMAT string. A tool
+    //     name is rejected unless it is a bare identifier, but a `%` reaching a
+    //     format string would be a bug waiting for the first one that is not.
+    //   - the fallback is `HOOK_OSC_BODY` verbatim (`lib/agentHooks.ts`), so a
+    //     payload this cannot read behaves exactly as it did before.
+    let emit = if (agent, sig) == ("claude", Signal::Attention) {
+        format!(
+            "[ -n \"$TERMIC_PTY\" ] || exit 0\n\
+             if [ -n \"$tool\" ]; then\n\
+               body=\"needs your permission: $tool\"\n\
+             else\n\
+               body='{ATTENTION_BODY}'\n\
+             fi\n\
+             emit() {{ printf '\\033]{NOTIFY_PREFIX}%s\\007' \"$body\" > \"$1\" 2>/dev/null; }}\n\
+             emit \"$TERMIC_PTY\" || emit /proc/1/fd/1 || emit /dev/tty || true"
+        )
+    } else {
+        format!(
+            "[ -n \"$TERMIC_PTY\" ] || exit 0\n\
+             emit() {{ printf '\\033]{payload}\\007' > \"$1\" 2>/dev/null; }}\n\
+             emit \"$TERMIC_PTY\" || emit /proc/1/fd/1 || emit /dev/tty || true"
+        )
+    };
 
     // grok is the one agent that reads ANOTHER agent's config (it scans
     // ~/.claude/settings.json too), so claude's script must stay silent when
@@ -1720,7 +1811,7 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
         // before the current set must read as stale, or `agent_hooks_sync`
         // skips it and the user keeps that set forever: v3 types into startup
         // dialogs, v4 holds a tab on `working` for the rest of the session.
-        assert_eq!(SCHEMA_VERSION, 5, "bump me with the hook set, or installs go stale silently");
+        assert_eq!(SCHEMA_VERSION, 6, "bump me with the hook set, or installs go stale silently");
     }
 
     #[test]
@@ -1865,6 +1956,143 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
         std::fs::File::open(&pty).unwrap().read_to_string(&mut out).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         out.contains("133;D")
+    }
+
+    /// Run claude's generated ATTENTION script against a payload and return the
+    /// body it put on the pty. Same harness as `done_emits_for` and for the same
+    /// reason: the extraction is shell, and shell is where the bugs are.
+    #[cfg(unix)]
+    fn attention_body_for(payload: &str) -> String {
+        attention_body_for_agent("claude", payload)
+    }
+
+    #[cfg(unix)]
+    fn attention_body_for_agent(agent: &str, payload: &str) -> String {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+
+        let dir = std::env::temp_dir().join(format!(
+            "termic-attn-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("attention.sh");
+        let pty = dir.join("pty");
+        std::fs::write(&script, script_body(agent, Signal::Attention)).unwrap();
+        std::fs::write(&pty, "").unwrap();
+
+        let mut child = Command::new("/bin/sh")
+            .arg(&script)
+            .env("TERMIC_TASK_ID", "t1")
+            .env("TERMIC_PTY", &pty)
+            .env_remove("GROK_HOOK_EVENT")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+        {
+            use std::io::Write as _;
+            child.stdin.as_mut().unwrap().write_all(payload.as_bytes()).unwrap();
+        }
+        assert!(child.wait().unwrap().success(), "a hook must never exit non-zero");
+
+        let mut out = String::new();
+        std::fs::File::open(&pty).unwrap().read_to_string(&mut out).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        // Strip introducer/terminator and the sender fields, leaving the body.
+        let start = out.find(NOTIFY_PREFIX).map(|i| i + NOTIFY_PREFIX.len());
+        match start {
+            Some(i) => out[i..].trim_end_matches('\u{7}').to_string(),
+            None => String::new(),
+        }
+    }
+
+    /// A `PermissionRequest` payload in the field order claude's own embedded
+    /// hooks reference documents for the tool events (2.1.259: `session_id`,
+    /// `tool_name`, `tool_input`). Values are synthetic.
+    #[cfg(unix)]
+    fn permission_payload(tool: &str, input: &str) -> String {
+        format!(
+            r#"{{"session_id":"s1","transcript_path":"/Users/u/.claude/x.jsonl",
+               "cwd":"/Users/u/proj","hook_event_name":"PermissionRequest",
+               "tool_name":"{tool}","tool_input":{input}}}"#
+        )
+    }
+
+    // GH #276, the second half. The hook is what the user actually SEES: it
+    // fires the moment claude blocks, and claude's own OSC 9 arrives 6.0s
+    // behind it, too late to compose the banner and rightly unable to raise a
+    // second one. So the hook's body has to carry the useful part.
+    #[test]
+    #[cfg(unix)]
+    fn claude_attention_names_the_tool_it_is_blocked_on() {
+        assert_eq!(
+            attention_body_for(&permission_payload("Bash", r#"{"command":"rm -rf build"}"#)),
+            "needs your permission: Bash",
+        );
+        // An MCP tool id is still a bare identifier, and is the case most worth
+        // naming: "needs your permission" alone tells you nothing about which
+        // of six servers is asking.
+        assert_eq!(
+            attention_body_for(&permission_payload("mcp__github__create_pr", "{}")),
+            "needs your permission: mcp__github__create_pr",
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn claude_attention_falls_back_rather_than_going_silent() {
+        // Events that are not tool events carry no `tool_name` (SessionStart,
+        // Stop, UserPromptSubmit). They must still notify, with the old body.
+        let no_tool = r#"{"session_id":"s1","hook_event_name":"Notification",
+                          "message":"Claude needs your permission"}"#;
+        assert_eq!(attention_body_for(no_tool), ATTENTION_BODY);
+        // Empty stdin is the degenerate case a runtime change could produce.
+        assert_eq!(attention_body_for(""), ATTENTION_BODY);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn claude_attention_rejects_a_tool_name_that_would_corrupt_the_payload() {
+        // A `;` would split OSC 777 into the wrong fields, and the body sits in
+        // the LAST field, so an injected one silently re-points the sender: a
+        // body of `termic;...` in the title position is how a hostile payload
+        // would forge a trusted signal. Rejected wholesale rather than
+        // sanitised, so there is no escaping rule to get subtly wrong.
+        assert_eq!(
+            attention_body_for(&permission_payload("Bash;notify;termic;pwned", "{}")),
+            ATTENTION_BODY,
+        );
+        // Same for a printf format specifier: the body goes through `%s` so it
+        // could not reach the format string anyway, and this pins BOTH guards.
+        assert_eq!(attention_body_for(&permission_payload("%s%s%n", "{}")), ATTENTION_BODY);
+        // Whitespace is NOT rejected, it is gone before the check: the payload
+        // is flattened first (same `tr -d '[:space:]'` the Done guard uses), so
+        // an interior space is deleted rather than caught. Asserted because it
+        // is surprising, and left alone because it is harmless - the extraction
+        // stops at the closing quote, so the worst case is two words glued into
+        // one identifier in a banner, never a field separator.
+        assert_eq!(
+            attention_body_for(&permission_payload("Bash Write", "{}")),
+            "needs your permission: BashWrite",
+        );
+    }
+
+    // The body must survive the TS side, which is the failure mode with no
+    // symptom: the hook fires correctly and termic drops it on the floor.
+    #[test]
+    fn the_enriched_attention_body_is_still_not_claudes_idle_nag() {
+        // `notificationWantsAttention`'s ignore pattern for claude is "is
+        // waiting for your input" (its 60s nudge after an unanswered turn).
+        for body in [ATTENTION_BODY, "needs your permission: Bash"] {
+            assert!(!body.contains("is waiting for your input"), "{body} would be filtered");
+        }
+        // And it must never collide with the READY body, which shares the OSC
+        // id and the trusted sender and is told apart by an exact match alone.
+        assert_ne!(ATTENTION_BODY, READY_BODY);
+        assert!(!"needs your permission: Bash".starts_with(READY_BODY));
     }
 
     /// One payload per background-task type claude can report, in the shape
@@ -2094,7 +2322,7 @@ fn a_v3_config_gains_the_readiness_event_without_losing_the_others() {
         assert!(js.contains("catch"), "and a catch that swallows");
         // Silent outside a termic pty, same rule as the shell scripts.
         assert!(js.contains("TERMIC_PTY") && js.contains("TERMIC_TASK_ID"));
-        assert!(js.contains(Signal::Attention.payload()));
+        assert!(js.contains(&Signal::Attention.payload()));
         assert!(js.contains("133;C") && js.contains("133;D"));
         // No raw control bytes in a generated source file.
         assert!(!js.contains('\u{1b}') && !js.contains('\u{7}'));
